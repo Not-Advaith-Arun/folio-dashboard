@@ -3,11 +3,12 @@ import {useEffect,useRef,useState} from 'react';
 import {validateWorkspace,type Workspace} from '../lib/workspace';
 import type {WorkspaceRow} from '../lib/workspace-store';
 export function readWorkspace(key:string):Workspace{
- return validateWorkspace({portfolio:JSON.parse(localStorage.getItem(key)||'{"holdings":[],"snapshots":[]}'),watchlist:JSON.parse(localStorage.getItem(key+'-watchlist')||'null'),flows:JSON.parse(localStorage.getItem(key+'-flows')||'[]'),targets:JSON.parse(localStorage.getItem(key+'-targets')||'null'),theme:localStorage.getItem('folio-theme')});
+ return validateWorkspace({portfolio:JSON.parse(localStorage.getItem(key)||'{"holdings":[],"snapshots":[]}'),watchlist:JSON.parse(localStorage.getItem(key+'-watchlist')||'null'),flows:JSON.parse(localStorage.getItem(key+'-flows')||'[]'),targets:JSON.parse(localStorage.getItem(key+'-targets')||'null'),theme:localStorage.getItem('folio-theme'),...(localStorage.getItem(key+'-layouts')?{layouts:JSON.parse(localStorage.getItem(key+'-layouts')!)}:{})});
 }
 export function applyWorkspace(key:string,w:Workspace){
  localStorage.setItem(key,JSON.stringify(w.portfolio));
  for(const [suffix,value]of [['-watchlist',w.watchlist],['-flows',w.flows],['-targets',w.targets]] as const){if(value===null)localStorage.removeItem(key+suffix);else localStorage.setItem(key+suffix,JSON.stringify(value));}
+ if(w.layouts)localStorage.setItem(key+'-layouts',JSON.stringify(w.layouts));else localStorage.removeItem(key+'-layouts');
  if(w.theme)localStorage.setItem('folio-theme',w.theme);
 }
 export function useCloudSync(key:string,onLoad:(w:Workspace)=>void){

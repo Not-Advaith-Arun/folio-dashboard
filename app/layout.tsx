@@ -1,5 +1,9 @@
 import type { Metadata } from "next";
+import "@fontsource-variable/geist";
+import "react-grid-layout/css/styles.css";
+import "react-resizable/css/styles.css";
 import "./globals.css";
+import "./design.css";
 
 export const metadata: Metadata = {
   title: "Folio · Your portfolio, clearly",

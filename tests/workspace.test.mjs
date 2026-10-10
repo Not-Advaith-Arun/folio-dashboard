@@ -5,6 +5,8 @@ import {workspaceStore} from '../lib/workspace-store.ts';
 const data={portfolio:{holdings:[],snapshots:[]},watchlist:['GOLDIETF.NS'],flows:[{id:'f1',date:'2026-10-09',amount:-1000}],targets:null,theme:'dark'};
 test('workspace roundtrip validates all persisted settings and rejects malformed financial data',()=>{
  assert.deepEqual(validateWorkspace(data),data);
+ const arranged={...data,layouts:{wide:[{i:'history',x:0,y:0,w:8,h:9}]}};assert.deepEqual(validateWorkspace(arranged),arranged);
+ assert.throws(()=>validateWorkspace({...data,layouts:{wide:[{i:'history',x:11,y:0,w:8,h:9}]}}));
  for(const invalid of [{...data,watchlist:['https://evil.test']},{...data,flows:[{id:'f',date:'2026-02-31',amount:1}]},{...data,theme:'invalid'},{...data,targets:{stock:101}}])assert.throws(()=>validateWorkspace(invalid));
 });
 test('cloud store isolates owners, prevents stale writes and keeps secrets server-side',async()=>{
