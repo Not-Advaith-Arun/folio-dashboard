@@ -1,0 +1,31 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {validateWorkspace} from '../lib/workspace.ts';
+import {workspaceStore} from '../lib/workspace-store.ts';
+const data={portfolio:{holdings:[],snapshots:[]},watchlist:['GOLDIETF.NS'],flows:[{id:'f1',date:'2026-10-09',amount:-1000}],targets:null,theme:'dark'};
+test('workspace roundtrip validates all persisted settings and rejects malformed financial data',()=>{
+ assert.deepEqual(validateWorkspace(data),data);
+ for(const invalid of [{...data,watchlist:['https://evil.test']},{...data,flows:[{id:'f',date:'2026-02-31',amount:1}]},{...data,theme:'invalid'},{...data,targets:{stock:101}}])assert.throws(()=>validateWorkspace(invalid));
+});
+test('cloud store isolates owners, prevents stale writes and keeps secrets server-side',async()=>{
+ const rows=new Map();const calls=[];
+ const transport=async(url,init)=>{const u=new URL(url);calls.push({u,init});const method=init.method;const id=method==='POST'?JSON.parse(init.body).user_id:u.searchParams.get('user_id').slice(3);const old=rows.get(id);
+  if(method==='GET')return Response.json(old?[old]:[]);
+  if(method==='POST'&&old)return Response.json({}, {status:409});
+  if(method==='PATCH'&&(!old||u.searchParams.get('revision')!=='eq.'+old.revision))return Response.json([]);
+  const next=JSON.parse(init.body);rows.set(id,next);return Response.json([next]);
+ };
+ const db=workspaceStore('https://example.supabase.co','sb_secret_test',transport);
+ assert.equal(await db.read('owner-a'),null);
+ assert.equal((await db.write('owner-a',data,null)).revision,1);
+ assert.equal(await db.read('owner-b'),null);
+ await assert.rejects(()=>db.write('owner-a',data,null),e=>e.status===409);
+ await db.write('owner-a',{...data,theme:'light'},1);
+ await assert.rejects(()=>db.write('owner-a',data,1),e=>e.status===409);
+ assert.equal((await db.read('owner-a')).data.theme,'light');
+ assert.equal(calls[0].init.headers.apikey,'sb_secret_test');assert.equal(calls[0].init.headers.Authorization,undefined);
+ assert.throws(()=>db.write('owner-a',data,-1),e=>e.status===400);
+ assert.throws(()=>workspaceStore('https://evil.test','sb_secret_test',transport));
+ const unavailable=workspaceStore('https://example.supabase.co','sb_secret_test',async()=>Response.json({secret:'hidden'}, {status:500}));
+ await assert.rejects(()=>unavailable.read('owner-a'),e=>!e.message.includes('hidden')&&e.status===503);
+});
