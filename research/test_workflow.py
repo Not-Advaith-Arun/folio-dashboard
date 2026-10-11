@@ -90,8 +90,20 @@ class ResearchWorkflow(unittest.TestCase):
                 self.assertEqual(changed["audit"]["folds"][0][field], audit["folds"][0][field])
             exported = json.loads((root / "latest.json").read_text())
             self.assertEqual(exported, changed)
+            self.assertNotEqual(changed["dataFingerprint"], first["dataFingerprint"])
             self.assertEqual(first["forecasts"][0]["status"], "pending")
-            second = run(fixture_loader())
+            # Repeating unchanged data skips fitting, but still refreshes news and
+            # resolves the ledger. A revised future price must invalidate reuse.
+            with patch("research.engine.walk_forward", side_effect=AssertionError("Unexpected retraining")):
+                second = run(fixture_loader())
+            self.assertEqual(second["backtest"], first["backtest"])
+            self.assertEqual(second["audit"], first["audit"])
+            cache = next(p for p in (root / "analyses").glob("*.json") if json.loads(p.read_text())["data"]["fingerprint"] == first["dataFingerprint"])
+            damaged = json.loads(cache.read_text())
+            damaged["data"]["backtest"]["metrics"][0]["totalReturn"] = 123
+            cache.write_text(json.dumps(damaged))
+            recovered = run(fixture_loader())
+            self.assertEqual(recovered["backtest"], first["backtest"])
             self.assertEqual(len(second["forecasts"]), 1)
             self.assertEqual(second["forecasts"][0]["createdAt"], first["forecasts"][0]["createdAt"])
             longer = run_research({**CONFIG, "years": 5}, root, loader=fixture_loader(), news_loader=fixture_news, scorer=fixture_scores)

@@ -267,35 +267,58 @@ def run_research(config, root: Path, progress=lambda *_: None, loader=market_his
         raise ValueError("At least four stocks with usable daily history are needed. Public data may be temporarily unavailable; retry later.")
     top_k = min(config["topK"], len(frames))
     panel, _ = feature_panel(frames)
-    backtest, mature = walk_forward(panel, top_k, config["costBps"], progress)
-    progress("Fitting final models on matured outcomes", 73)
+    from research.audit import AUDIT_VERSION
+    import sklearn
+    mature = panel.dropna(subset=["target", "labelEnd"])
     latest_date = panel.date.max()
-    latest = panel[panel.date == latest_date].copy()
-    fingerprint = hashlib.sha256(pd.util.hash_pandas_object(mature[["date", "symbol", *FEATURES, "target"]], index=False).values.tobytes()).hexdigest()
-    model_id = hashlib.sha256(json.dumps({"version": VERSION, "symbols": sorted(frames), "data": fingerprint, "features": FEATURES}, sort_keys=True).encode()).hexdigest()[:12]
-    fitted = estimators()
-    for name, model in fitted.items():
-        model.fit(mature[FEATURES], mature.target)
-        latest[name] = model.predict(latest[FEATURES])
-    model_dir = root / "models"
-    model_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    with tempfile.NamedTemporaryFile(dir=model_dir, delete=False) as f:
-        model_temp = f.name
-    joblib.dump({"models": fitted, "features": FEATURES, "dataFingerprint": fingerprint, "version": VERSION}, model_temp)
-    os.chmod(model_temp, 0o600)
-    os.replace(model_temp, model_dir / f"{model_id}.joblib")
-    latest["Ensemble"] = ranked_blend(latest, list(estimators()))
-    from research.audit import run_audit, AUDIT_VERSION, RICH_FEATURES
-    audit, audit_models = run_audit(panel, top_k, config["costBps"], progress)
-    audit_fingerprint = hashlib.sha256(pd.util.hash_pandas_object(mature[["date", "symbol", *RICH_FEATURES, "target"]], index=False).values.tobytes()).hexdigest()
-    audit_id = hashlib.sha256(json.dumps({"version": AUDIT_VERSION, "data": audit_fingerprint, "topK": top_k, "costBps": config["costBps"]}, sort_keys=True).encode()).hexdigest()[:12]
-    audit["modelId"] = audit_id
-    audit["dataFingerprint"] = audit_fingerprint
-    with tempfile.NamedTemporaryFile(dir=model_dir, delete=False) as f:
-        audit_temp = f.name
-    joblib.dump({**audit_models, "dataFingerprint": audit_fingerprint}, audit_temp)
-    os.chmod(audit_temp, 0o600)
-    os.replace(audit_temp, model_dir / f"{audit_id}.joblib")
+    code_hash = hashlib.sha256(Path(__file__).read_bytes() + Path(__file__).with_name("audit.py").read_bytes()).hexdigest()
+    history_hash = hashlib.sha256(pd.util.hash_pandas_object(panel.sort_values(["date", "symbol"]), index=False).values.tobytes()).hexdigest()
+    analysis_key = hashlib.sha256(json.dumps({"history": history_hash, "code": code_hash, "years": config["years"], "topK": top_k, "costBps": config["costBps"], "version": VERSION, "audit": AUDIT_VERSION, "libraries": [np.__version__, pd.__version__, sklearn.__version__]}, sort_keys=True).encode()).hexdigest()
+    analysis_path = root / "analyses" / f"{analysis_key}.json"
+    cached = None
+    try:
+        candidate = load_json(analysis_path, None)
+        if candidate and candidate["key"] == analysis_key and candidate["checksum"] == hashlib.sha256(json.dumps(candidate["data"], sort_keys=True).encode()).hexdigest() and all((root / "models" / f"{candidate["data"][n]}.joblib").exists() for n in ["modelId", "auditId"]):
+            cached = candidate["data"]
+    except (ValueError, KeyError, TypeError):
+        pass  # A damaged local cache is rebuilt, never used as evidence.
+    if cached:
+        progress("Reusing unchanged price analysis; refreshing news and forward outcomes", 85)
+        backtest, audit = cached["backtest"], cached["audit"]
+        model_id, audit_id, fingerprint = cached["modelId"], cached["auditId"], cached["fingerprint"]
+        latest = pd.DataFrame(cached["latest"])
+    else:
+        backtest, mature = walk_forward(panel, top_k, config["costBps"], progress)
+        progress("Fitting final models on matured outcomes", 73)
+        latest_date = panel.date.max()
+        latest = panel[panel.date == latest_date].copy()
+        fingerprint = hashlib.sha256(pd.util.hash_pandas_object(mature[["date", "symbol", *FEATURES, "target"]], index=False).values.tobytes()).hexdigest()
+        model_id = hashlib.sha256(json.dumps({"version": VERSION, "symbols": sorted(frames), "data": fingerprint, "features": FEATURES, "code": code_hash}, sort_keys=True).encode()).hexdigest()[:12]
+        fitted = estimators()
+        for name, model in fitted.items():
+            model.fit(mature[FEATURES], mature.target)
+            latest[name] = model.predict(latest[FEATURES])
+        model_dir = root / "models"
+        model_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with tempfile.NamedTemporaryFile(dir=model_dir, delete=False) as f:
+            model_temp = f.name
+        joblib.dump({"models": fitted, "features": FEATURES, "dataFingerprint": fingerprint, "version": VERSION}, model_temp)
+        os.chmod(model_temp, 0o600)
+        os.replace(model_temp, model_dir / f"{model_id}.joblib")
+        latest["Ensemble"] = ranked_blend(latest, list(estimators()))
+        from research.audit import run_audit, AUDIT_VERSION, RICH_FEATURES
+        audit, audit_models = run_audit(panel, top_k, config["costBps"], progress)
+        audit_fingerprint = hashlib.sha256(pd.util.hash_pandas_object(mature[["date", "symbol", *RICH_FEATURES, "target"]], index=False).values.tobytes()).hexdigest()
+        audit_id = hashlib.sha256(json.dumps({"version": AUDIT_VERSION, "data": audit_fingerprint, "topK": top_k, "costBps": config["costBps"], "code": code_hash}, sort_keys=True).encode()).hexdigest()[:12]
+        audit["modelId"] = audit_id
+        audit["dataFingerprint"] = audit_fingerprint
+        with tempfile.NamedTemporaryFile(dir=model_dir, delete=False) as f:
+            audit_temp = f.name
+        joblib.dump({**audit_models, "dataFingerprint": audit_fingerprint}, audit_temp)
+        os.chmod(audit_temp, 0o600)
+        os.replace(audit_temp, model_dir / f"{audit_id}.joblib")
+        analysis = {"backtest": backtest, "audit": audit, "modelId": model_id, "auditId": audit_id, "fingerprint": fingerprint, "latest": latest[["symbol", "close", "Ensemble", *estimators()]].to_dict("records")}
+        atomic_json(analysis_path, {"key": analysis_key, "checksum": hashlib.sha256(json.dumps(analysis, sort_keys=True).encode()).hexdigest(), "data": analysis})
     articles = []
     if config["includeNews"]:
         for i, symbol in enumerate(frames):
