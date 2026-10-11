@@ -152,6 +152,20 @@ class ResearchWorkflow(unittest.TestCase):
             day["marketTrend"] = -1
             self.assertEqual(allocation(day, 2)[0], {})
             self.assertEqual(allocation(day, 2)[1]["exposure"], 0)
+            # The absolute entry hypothesis calibrates on a disjoint past block;
+            # current/future outcomes must not enter either fitting stage.
+            from research.entry import predict_entry
+            panel["grossReturn"] = panel.actual
+            signal = panel.date.max()
+            entry, lineage = predict_entry(panel, signal)
+            self.assertLess(lineage["lastTrainingOutcome"], lineage["calibrationStart"])
+            self.assertLess(lineage["lastCalibrationOutcome"], lineage["signal"])
+            self.assertTrue(entry.profitProbability.between(0, 1).all())
+            future_panel = panel.copy()
+            future_panel.loc[future_panel.date >= signal, "grossReturn"] = 1000
+            changed_entry, _ = predict_entry(future_panel, signal)
+            np.testing.assert_array_equal(entry.profitProbability, changed_entry.profitProbability)
+            np.testing.assert_array_equal(entry.grossEstimate, changed_entry.grossEstimate)
             exported = json.loads((root / "latest.json").read_text())
             self.assertEqual(exported, changed)
             self.assertNotEqual(changed["dataFingerprint"], first["dataFingerprint"])
