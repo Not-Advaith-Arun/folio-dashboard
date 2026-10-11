@@ -54,3 +54,9 @@ next-env.d.ts
 /.codex/
 /outputs/
 /work/
+
+# Local Python research caches and model artifacts.
+__pycache__/
+*.pyc
+/.venv/
+/.folio-research/
