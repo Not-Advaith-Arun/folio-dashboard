@@ -84,6 +84,33 @@ class ResearchWorkflow(unittest.TestCase):
             replay({"A": bad}, [window], 1000.)
         with self.assertRaisesRegex(ValueError, "Overlapping"):
             replay({"A": frame}, [window, window], 1000.)
+        # Discovery must not silently promote SME/dummy index securities to the
+        # ordinary one-share execution workflow. These are explicit offline CSVs.
+        from research.universe import build_registry, daily_snapshot
+        main = "SYMBOL,NAME OF COMPANY,SERIES,DATE OF LISTING,MARKET LOT,ISIN NUMBER\nA,Alpha,EQ,01-JAN-2020,1,INE000A01001\n"
+        sme = "SYMBOL,NAME_OF_COMPANY,SERIES,DATE_OF_LISTING,ISIN_NUMBER\nB,Beta,SM,01-Jan-24,INE000B01001\n"
+        index = "Company Name,Industry,Symbol,Series,ISIN Code\nAlpha,Capital Goods,A,EQ,INE000A01001\nDummy,Dummy,DUMMY,EQ,DUM00000001\n"
+        registry = build_registry(main, sme, {"Microcap fixture": index}, "2025-01-01T00:00:00Z")
+        self.assertEqual(registry["coverage"]["uniqueSecurities"], 2)
+        self.assertEqual(registry["coverage"]["industryTagged"], 1)
+        self.assertEqual(len(registry["coverage"]["unmatchedIndexRows"]), 1)
+        self.assertFalse(registry["historicalMembershipVerified"])
+        self.assertTrue(all(not s["investmentEligible"] for s in registry["securities"]))
+        beta = next(s for s in registry["securities"] if s["name"] == "Beta")
+        self.assertIn("Market lot unknown", beta["flags"])
+        with self.assertRaisesRegex(ValueError, "Duplicate"):
+            build_registry(main + main.splitlines()[1] + "\n", sme, {}, "2025-01-01T00:00:00Z")
+        daily = "SYMBOL,SERIES,DATE1,OPEN_PRICE,HIGH_PRICE,LOW_PRICE,CLOSE_PRICE,TTL_TRD_QNTY,TURNOVER_LACS\nA,EQ,31-Dec-2024,100,105,95,102,100,0.1\nB,SM,31-Dec-2024,100,1,95,102,100,0.1\nC,EQ,31-Dec-2024,100,105,95,102,100,0.1\n"
+        snapshot = daily_snapshot(daily, registry, "2024-12-31", "2025-01-01T00:00:00Z")
+        self.assertEqual(snapshot["coverage"]["matchedSecurities"], 1)
+        self.assertEqual(snapshot["coverage"]["quarantinedRows"], 1)
+        self.assertEqual(snapshot["coverage"]["unmatchedRows"], 1)
+        self.assertEqual(snapshot["bars"][0]["turnoverInr"], 10000)
+        self.assertFalse(registry["securities"][0]["investmentEligible"])
+        with self.assertRaisesRegex(ValueError, "different trading date"):
+            daily_snapshot(daily, registry, "2024-12-30", "2025-01-01T00:00:00Z")
+        with self.assertRaisesRegex(ValueError, "follow the trading date"):
+            daily_snapshot(daily, registry, "2025-01-02", "2025-01-01T00:00:00Z")
 
     def test_train_export_repeat_and_resolve_future_outcomes(self):
         with tempfile.TemporaryDirectory() as folder:
