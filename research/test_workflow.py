@@ -46,6 +46,45 @@ def fixture_scores(articles):
 
 
 class ResearchWorkflow(unittest.TestCase):
+    def test_whole_share_cash_cost_split_and_daily_replay(self):
+        # A spanning execution workflow protects critical money identities,
+        # corporate actions and settlement; it is not a narrow estimator test.
+        from research.execution import replay, charges
+        dates = pd.bdate_range("2025-01-02", periods=5)
+        frame = pd.DataFrame({"open": [100., 50., 55., 56., 57.],
+                              "close": [100., 50., 55., 56., 57.],
+                              "high": [101., 51., 56., 57., 58.],
+                              "low": [99., 49., 54., 55., 56.],
+                              "volume": 10000, "splits": [0., 2., 0., 0., 0.],
+                              "dividends": [0., 1., 0., 0., 0.]}, index=dates)
+        window = {"signal": "2025-01-01", "entry": str(dates[0].date()),
+                  "exit": str(dates[2].date()), "weights": {"A": 1.}}
+        second = {"signal": str(dates[1].date()), "entry": str(dates[2].date()),
+                  "exit": str(dates[4].date()), "weights": {"A": 1.}}
+        result = replay({"A": frame}, [window, second], 1000., 0.)
+        self.assertEqual([(o["side"], o["units"]) for o in result["orders"]],
+                         [("buy", 9), ("sell", 18), ("buy", 1), ("sell", 1)])
+        self.assertAlmostEqual(charges(10000., "buy"), 23.67406)
+        self.assertEqual(result["omittedDividendEntitlements"], 18.)
+        self.assertTrue(all(o["units"] == int(o["units"]) for o in result["orders"]))
+        for point in result["curve"]:
+            self.assertAlmostEqual(point["equity"], point["cash"] + point["unsettled"] + point["invested"])
+            self.assertGreaterEqual(point["cash"], 0.)
+        inflow = sum(o["price"] * o["units"] * (1 if o["side"] == "sell" else -1) for o in result["orders"])
+        self.assertAlmostEqual(result["ending"], 1000. + inflow - result["fees"])
+        changed = frame.copy()
+        changed.loc[dates[-1], ["open", "close", "high", "low"]] *= 2
+        future = replay({"A": changed}, [window, second], 1000., 0.)
+        self.assertEqual(result["orders"][:3], future["orders"][:3])
+        unaffordable = replay({"A": frame}, [window], 50., 0.)
+        self.assertEqual(unaffordable["orders"], [])
+        self.assertEqual(unaffordable["ending"], 50.)
+        bad = frame.copy(); bad.loc[dates[0], "high"] = 1
+        with self.assertRaisesRegex(ValueError, "Invalid OHLC"):
+            replay({"A": bad}, [window], 1000.)
+        with self.assertRaisesRegex(ValueError, "Overlapping"):
+            replay({"A": frame}, [window, window], 1000.)
+
     def test_train_export_repeat_and_resolve_future_outcomes(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
