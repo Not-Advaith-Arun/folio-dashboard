@@ -57,8 +57,30 @@ class ResearchWorkflow(unittest.TestCase):
             for fold in first["backtest"]["folds"]:
                 self.assertLess(fold["lastTrainingOutcome"], fold["testStart"])
                 self.assertLess(fold["trainEnd"], fold["testStart"])
+            audit = first["audit"]
+            self.assertEqual(len(audit["metrics"]), 8)
+            self.assertEqual(len(audit["costStress"]), 5)
+            self.assertAlmostEqual(sum(a["weight"] for a in audit["latest"]["allocations"]), audit["latest"]["exposure"])
+            for fold in audit["folds"]:
+                self.assertLess(fold["innerTrainLastOutcome"], fold["tuningStart"])
+                self.assertLess(fold["tuningLastOutcome"], fold["calibrationStart"])
+                self.assertLess(fold["finalTrainLastOutcome"], fold["calibrationStart"])
+                self.assertLess(fold["calibrationLastOutcome"], fold["testStart"])
+                self.assertAlmostEqual(sum(fold["weights"].values()), 1)
+            # Perturb future evaluation prices: the first fold's development choices
+            # must remain identical. This guards the central financial leakage risk.
+            source = fixture_loader()
+            boundary = pd.Timestamp(audit["folds"][0]["testStart"])
+            def perturbed(symbol, years, root):
+                frame = source(symbol, years, root)
+                mask = frame.index >= boundary
+                frame.loc[mask, ["open", "high", "low", "close"]] *= np.linspace(1, 1.2, int(mask.sum()))[:, None]
+                return frame
+            changed = run(perturbed)
+            for field in ["selected", "weights", "candidates", "intervalRadius"]:
+                self.assertEqual(changed["audit"]["folds"][0][field], audit["folds"][0][field])
             exported = json.loads((root / "latest.json").read_text())
-            self.assertEqual(exported, first)
+            self.assertEqual(exported, changed)
             self.assertEqual(first["forecasts"][0]["status"], "pending")
             second = run(fixture_loader())
             self.assertEqual(len(second["forecasts"]), 1)
@@ -72,6 +94,8 @@ class ResearchWorkflow(unittest.TestCase):
             source = fixture_loader(extended=True)
             actual = np.mean([source(s, 3, root).loc[old["exitDate"], "open"] / source(s, 3, root).loc[old["entryDate"], "open"] - 1 for s in old["pricePicks"]]) - .002
             self.assertAlmostEqual(old["priceReturn"], actual)
+            audit_actual = sum(w * (source(s, 3, root).loc[old["exitDate"], "open"] / source(s, 3, root).loc[old["entryDate"], "open"] - 1) for s, w in old["auditWeights"].items()) - old["auditExposure"] * .002
+            self.assertAlmostEqual(old["auditReturn"], audit_actual)
             self.assertTrue(any("overlap" in w for w in resolved["warnings"]))
 
     def test_local_access_invalid_input_and_full_job(self):

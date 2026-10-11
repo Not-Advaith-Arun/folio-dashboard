@@ -86,6 +86,9 @@ def feature_panel(frames):
     realized = opens.shift(-(HORIZON + 1)) / opens.shift(-1) - 1
     benchmark = realized.mean(axis=1)
     market20 = closes.pct_change(20).mean(axis=1)
+    market_returns = closes.pct_change().mean(axis=1)
+    market_vol = market_returns.rolling(20).std() * np.sqrt(252)
+    market_trend = (closes / closes.rolling(200).mean() - 1).mean(axis=1)
     rows = []
     for symbol, source in frames.items():
         f = source.loc[dates]
@@ -101,6 +104,12 @@ def feature_panel(frames):
         x["target"] = (realized[symbol] - benchmark).to_numpy()
         x["labelEnd"] = pd.Series(dates).shift(-(HORIZON + 1)).to_numpy()
         x["close"] = f.close.to_numpy()
+        for days in [1, 10, 120]:
+            x[f"return{days}"] = f.close.pct_change(days).to_numpy()
+        x["relative20"] = x.return20 - x.market20
+        x["trend200"] = (f.close / f.close.rolling(200).mean() - 1).to_numpy()
+        x["marketTrend"] = market_trend.to_numpy()
+        x["marketVol"] = market_vol.to_numpy()
         rows.append(x)
     panel = pd.concat(rows, ignore_index=True).replace([np.inf, -np.inf], np.nan).dropna(subset=FEATURES)
     return panel, opens
@@ -238,6 +247,9 @@ def resolve_ledger(root, frames):
         actual = {s: float(frames[s].loc[exit_date, "open"] / frames[s].loc[entry, "open"] - 1) for s in symbols}
         cost = forecast["costBps"] / 10000
         forecast.update(status="resolved", entryDate=str(entry.date()), exitDate=str(exit_date.date()), priceReturn=float(np.mean([actual[s] for s in forecast["pricePicks"]])) - cost, newsReturn=float(np.mean([actual[s] for s in forecast["newsPicks"]])) - cost, benchmarkReturn=float(np.mean(list(actual.values()))) - cost)
+        if "auditWeights" in forecast:
+            forecast["auditReturn"] = sum(w * actual[s] for s, w in forecast["auditWeights"].items()) - forecast["auditExposure"] * cost
+
     return ledger
 
 
@@ -273,15 +285,26 @@ def run_research(config, root: Path, progress=lambda *_: None, loader=market_his
     os.chmod(model_temp, 0o600)
     os.replace(model_temp, model_dir / f"{model_id}.joblib")
     latest["Ensemble"] = ranked_blend(latest, list(estimators()))
+    from research.audit import run_audit, AUDIT_VERSION, RICH_FEATURES
+    audit, audit_models = run_audit(panel, top_k, config["costBps"], progress)
+    audit_fingerprint = hashlib.sha256(pd.util.hash_pandas_object(mature[["date", "symbol", *RICH_FEATURES, "target"]], index=False).values.tobytes()).hexdigest()
+    audit_id = hashlib.sha256(json.dumps({"version": AUDIT_VERSION, "data": audit_fingerprint, "topK": top_k, "costBps": config["costBps"]}, sort_keys=True).encode()).hexdigest()[:12]
+    audit["modelId"] = audit_id
+    audit["dataFingerprint"] = audit_fingerprint
+    with tempfile.NamedTemporaryFile(dir=model_dir, delete=False) as f:
+        audit_temp = f.name
+    joblib.dump({**audit_models, "dataFingerprint": audit_fingerprint}, audit_temp)
+    os.chmod(audit_temp, 0o600)
+    os.replace(audit_temp, model_dir / f"{audit_id}.joblib")
     articles = []
     if config["includeNews"]:
         for i, symbol in enumerate(frames):
-            progress(f"Reading headlines for {symbol}", 79 + int(i / len(frames) * 10))
+            progress(f"Reading headlines for {symbol}", 86 + int(i / len(frames) * 7))
             try:
                 articles.extend(news_loader(symbol, config.get("names", {}).get(symbol), root))
             except Exception:
                 warnings.append(f"{symbol}: news unavailable; no news adjustment applied.")
-        progress("Scoring headlines locally with FinBERT", 90)
+        progress("Scoring headlines locally with FinBERT", 94)
         try:
             articles = scorer(articles)
         except Exception as e:
@@ -302,10 +325,10 @@ def run_research(config, root: Path, progress=lambda *_: None, loader=market_his
     news_picks = [r["symbol"] for r in rankings[:top_k]]
     ledger = resolve_ledger(root, frames)
     signal_date = max(str(latest_date.date()), datetime.now(ZoneInfo("Asia/Kolkata")).date().isoformat())
-    experiment = hashlib.sha256(json.dumps({"symbols": sorted(frames), "topK": top_k, "costBps": config["costBps"], "includeNews": config["includeNews"], "version": VERSION, "overlay": "freshness-v1"}, sort_keys=True).encode()).hexdigest()[:12]
+    experiment = hashlib.sha256(json.dumps({"symbols": sorted(frames), "topK": top_k, "costBps": config["costBps"], "includeNews": config["includeNews"], "version": VERSION, "overlay": "freshness-v1", "audit": AUDIT_VERSION}, sort_keys=True).encode()).hexdigest()[:12]
     forecast_id = f"{experiment}-{signal_date}"
     if not any(p["id"] == forecast_id for p in ledger):
-        ledger.append({"id": forecast_id, "createdAt": now, "signalDate": signal_date, "modelId": model_id, "experiment": experiment, "universe": sorted(frames), "pricePicks": price_picks, "newsPicks": news_picks, "costBps": config["costBps"], "status": "pending", "newsEnabled": bool(articles)})
+        ledger.append({"id": forecast_id, "createdAt": now, "signalDate": signal_date, "modelId": model_id, "experiment": experiment, "universe": sorted(frames), "pricePicks": price_picks, "newsPicks": news_picks, "costBps": config["costBps"], "status": "pending", "newsEnabled": bool(articles), "auditModelId": audit_id, "auditStrategy": audit["latest"]["strategy"], "auditWeights": {a["symbol"]: a["weight"] for a in audit["latest"]["allocations"]}, "auditExposure": audit["latest"]["exposure"]})
     ledger = ledger[-500:]
     atomic_json(root / "forecasts.json", ledger)
     if articles:
@@ -314,7 +337,7 @@ def run_research(config, root: Path, progress=lambda *_: None, loader=market_his
     if stale_days > 4:
         warnings.append(f"Latest common market data is {stale_days} calendar days old. Treat rankings as stale.")
     warnings.extend(["Historical evaluation uses today's selected stock cohort; survivorship bias remains.", "News overlay is experimental and excluded from the historical price backtest. Sentiment is not a return probability.", "Adjusted public prices can be revised. Backtest is a research simulation, not an execution record.", "Five-session sampled drawdown misses losses inside each holding period. Cost is a configurable assumption, not a verified broker charge.", "Paper forecasts may overlap across days; their individual returns must not be compounded as an executable portfolio."])
-    report = {"version": 1, "engineVersion": VERSION, "id": forecast_id, "modelId": model_id, "dataFingerprint": fingerprint, "textModelRevision": TEXT_REVISION, "generatedAt": now, "marketAsOf": str(latest_date.date()), "source": "Yahoo Finance via yfinance · personal research, adjusted daily OHLCV", "config": {**config, "symbols": list(frames), "topK": top_k}, "coverage": {"requested": len(symbols), "loaded": len(frames), "rows": len(panel), "trainingEnd": str(mature.date.max().date()), "newsArticles": len(articles)}, "rankings": rankings, "backtest": backtest, "articles": articles, "forecasts": [f for f in ledger if f["experiment"] == experiment][-100:], "warnings": warnings}
+    report = {"version": 1, "engineVersion": VERSION, "id": forecast_id, "modelId": model_id, "dataFingerprint": fingerprint, "textModelRevision": TEXT_REVISION, "generatedAt": now, "marketAsOf": str(latest_date.date()), "source": "Yahoo Finance via yfinance · personal research, adjusted daily OHLCV", "config": {**config, "symbols": list(frames), "topK": top_k}, "coverage": {"requested": len(symbols), "loaded": len(frames), "rows": len(panel), "trainingEnd": str(mature.date.max().date()), "newsArticles": len(articles)}, "rankings": rankings, "backtest": backtest, "audit": audit, "articles": articles, "forecasts": [f for f in ledger if f["experiment"] == experiment][-100:], "warnings": warnings}
     atomic_json(root / "latest.json", report)
     atomic_json(root / "runs" / f"{forecast_id}-{now[:19].replace(':', '-')}.json", report)
     progress("Research complete", 100)

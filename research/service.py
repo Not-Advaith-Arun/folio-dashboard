@@ -93,7 +93,7 @@ def run(config: RunConfig):
 
     def progress(message, percent):
         with lock:
-            state.update(message=message, progress=percent)
+            state.update(message=message, progress=max(state["progress"], percent))
 
     def job():
         try:
