@@ -3,12 +3,13 @@ import {useEffect,useRef,useState} from 'react';
 import {validateWorkspace,type Workspace} from '../lib/workspace';
 import type {WorkspaceRow} from '../lib/workspace-store';
 export function readWorkspace(key:string):Workspace{
- return validateWorkspace({portfolio:JSON.parse(localStorage.getItem(key)||'{"holdings":[],"snapshots":[]}'),watchlist:JSON.parse(localStorage.getItem(key+'-watchlist')||'null'),flows:JSON.parse(localStorage.getItem(key+'-flows')||'[]'),targets:JSON.parse(localStorage.getItem(key+'-targets')||'null'),theme:localStorage.getItem('folio-theme'),...(localStorage.getItem(key+'-layouts')?{layouts:JSON.parse(localStorage.getItem(key+'-layouts')!)}:{}),...(localStorage.getItem(key+'-research')?{research:JSON.parse(localStorage.getItem(key+'-research')!)}:{})});
+ return validateWorkspace({portfolio:JSON.parse(localStorage.getItem(key)||'{"holdings":[],"snapshots":[]}'),watchlist:JSON.parse(localStorage.getItem(key+'-watchlist')||'null'),flows:JSON.parse(localStorage.getItem(key+'-flows')||'[]'),targets:JSON.parse(localStorage.getItem(key+'-targets')||'null'),theme:localStorage.getItem('folio-theme'),...(localStorage.getItem(key+'-layouts')?{layouts:JSON.parse(localStorage.getItem(key+'-layouts')!)}:{}),...(localStorage.getItem(key+'-research')?{research:JSON.parse(localStorage.getItem(key+'-research')!)}:{}),...(localStorage.getItem(key+'-research-layouts')?{researchLayouts:JSON.parse(localStorage.getItem(key+'-research-layouts')!)}:{})});
 }
 export function applyWorkspace(key:string,w:Workspace){
  localStorage.setItem(key,JSON.stringify(w.portfolio));
  for(const [suffix,value]of [['-watchlist',w.watchlist],['-flows',w.flows],['-targets',w.targets]] as const){if(value===null)localStorage.removeItem(key+suffix);else localStorage.setItem(key+suffix,JSON.stringify(value));}
  if(w.layouts)localStorage.setItem(key+'-layouts',JSON.stringify(w.layouts));else localStorage.removeItem(key+'-layouts');
+ if(w.researchLayouts)localStorage.setItem(key+'-research-layouts',JSON.stringify(w.researchLayouts));else localStorage.removeItem(key+'-research-layouts');
  if(w.research)localStorage.setItem(key+'-research',JSON.stringify(w.research));else localStorage.removeItem(key+'-research');
  if(w.theme)localStorage.setItem('folio-theme',w.theme);
 }

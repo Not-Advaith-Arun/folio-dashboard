@@ -5,14 +5,14 @@ import {GripHorizontal,SlidersHorizontal,RotateCcw,Check,Move,Maximize2} from 'l
 import {readWorkspace} from './cloud-sync';
 import {persistLocal} from '../lib/client-storage';
 export type Widget={id:string;label:string;content:ReactNode;x:number;y:number;w:number;h:number;minH?:number};
-export function WidgetBoard({widgets,storageKey}:{widgets:Widget[];storageKey:string}){
+export function WidgetBoard({widgets,storageKey,workspace='portfolio'}:{widgets:Widget[];storageKey:string;workspace?:'portfolio'|'research'}){
  const {width,containerRef,mounted}=useContainerWidth();
  const [layouts,setLayouts]=useState<Record<string,Layout>>({}),[editing,setEditing]=useState(false),[ready,setReady]=useState(false),[notice,setNotice]=useState('');
  const mobile=width<680,cols=width<1000?6:12,bucket=cols===12?'wide':'compact';
  const defaults:Layout=widgets.map((w,i)=>({i:w.id,x:cols===12?w.x:0,y:cols===12?w.y:i*8,w:cols===12?w.w:6,h:w.h,minW:cols===12?3:3,minH:w.minH??4,maxW:cols,maxH:30}));
  const saved=layouts[bucket];const layout=defaults.map(d=>{const s=saved?.find(s=>s.i===d.i);return s?{...d,x:Math.min(s.x,cols-s.w),y:s.y,w:Math.min(s.w,cols),h:Math.max(s.h,d.minH!)}:d;});
- useEffect(()=>{try{setLayouts(readWorkspace(storageKey).layouts??{});}catch{}setReady(true);},[storageKey]);
- function persist(next:Record<string,Layout>){setLayouts(next);try{persistLocal(storageKey+'-layouts',JSON.stringify(next));setNotice('');}catch{setNotice('Layout could not be saved on this device.');}}
+ useEffect(()=>{try{const w=readWorkspace(storageKey);let saved=workspace==='research'?w.researchLayouts:w.layouts;if(workspace==='research'&&saved===undefined){const legacyKey='folio-research-layout-'+storageKey;if(localStorage.getItem(legacyKey+'-layouts')){saved=readWorkspace(legacyKey).layouts;persistLocal(storageKey+'-research-layouts',JSON.stringify(saved??{}));}}setLayouts(saved??{});}catch{}setReady(true);},[storageKey,workspace]);
+ function persist(next:Record<string,Layout>){setLayouts(next);try{persistLocal(storageKey+(workspace==='research'?'-research-layouts':'-layouts'),JSON.stringify(next));setNotice('');}catch{setNotice('Layout could not be saved on this device.');}}
  function change(next:Layout){if(!ready)return;persist({...layouts,[bucket]:next.map(({i,x,y,w,h})=>({i,x,y,w,h}))});}
  function adjust(id:string,action:'move'|'size'){
   const current=layout.find(w=>w.i===id)!;const ordered=[...layout].sort((a,b)=>a.y-b.y||a.x-b.x);const next=ordered[(ordered.findIndex(w=>w.i===id)+1)%ordered.length];
