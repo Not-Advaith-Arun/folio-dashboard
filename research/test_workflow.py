@@ -58,7 +58,7 @@ class ResearchWorkflow(unittest.TestCase):
                 self.assertLess(fold["lastTrainingOutcome"], fold["testStart"])
                 self.assertLess(fold["trainEnd"], fold["testStart"])
             audit = first["audit"]
-            self.assertEqual(len(audit["metrics"]), 8)
+            self.assertEqual(len(audit["metrics"]), 9)
             self.assertEqual(len(audit["costStress"]), 5)
             self.assertAlmostEqual(sum(a["weight"] for a in audit["latest"]["allocations"]), audit["latest"]["exposure"])
             for fold in audit["folds"]:
@@ -85,6 +85,9 @@ class ResearchWorkflow(unittest.TestCase):
             second = run(fixture_loader())
             self.assertEqual(len(second["forecasts"]), 1)
             self.assertEqual(second["forecasts"][0]["createdAt"], first["forecasts"][0]["createdAt"])
+            longer = run_research({**CONFIG, "years": 5}, root, loader=fixture_loader(), news_loader=fixture_news, scorer=fixture_scores)
+            self.assertNotEqual(longer["id"], first["id"])
+            self.assertEqual(len(longer["forecasts"]), 1)
             resolved = run(fixture_loader(extended=True))
             old = next(f for f in resolved["forecasts"] if f["id"] == first["id"])
             self.assertEqual(old["status"], "resolved")

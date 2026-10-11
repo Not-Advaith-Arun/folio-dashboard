@@ -14,15 +14,23 @@ from sklearn.preprocessing import StandardScaler
 
 from research.engine import FEATURES, HORIZON, estimators, performance, rank_ic
 
-AUDIT_VERSION = "nested-audit-1"
+AUDIT_VERSION = "nested-audit-2"
 RICH_FEATURES = [*FEATURES, "return1", "return10", "return120", "relative20", "trend200", "marketTrend", "marketVol"]
-CANDIDATES = ["Uniform ensemble", "Validation weighted", "Rich Ridge", "Risk managed", "Momentum", "Cash"]
+CANDIDATES = ["Uniform ensemble", "Validation weighted", "Rich Ridge", "Cross-sectional Ridge", "Risk managed", "Momentum", "Cash"]
 REFERENCES = [
+    {"title": "Empirical Asset Pricing via Machine Learning", "url": "https://www.nber.org/papers/w25398", "adaptation": "A separate cross-sectional rank-normalized linear challenger; not a replication of the original study."},
     {"title": "FinTSB (2025)", "url": "https://arxiv.org/abs/2502.18834", "adaptation": "Common execution/cost protocol and explicit market conditions."},
     {"title": "Financial time-series benchmark (March 2026)", "url": "https://arxiv.org/abs/2603.01820", "adaptation": "Cost stress, risk-adjusted evaluation and computational restraint."},
     {"title": "Equity portfolio benchmark (June 2026)", "url": "https://arxiv.org/abs/2606.09420", "adaptation": "Regularized linear challenger and portfolio constraints; no assumption complex models win."},
     {"title": "Conformal position sizing, revised October 2026", "url": "https://arxiv.org/abs/2608.01494", "adaptation": "Empirical uncertainty bands and realized coverage are separate from profitability; no Kelly leverage."},
 ]
+
+
+def cross_features(frame):
+    # Normalize today's cross-section only; never use later trading dates.
+    # Market-wide features are identical within a date and carry no rank signal.
+    columns = [c for c in RICH_FEATURES if c not in ["market20", "marketTrend", "marketVol"]]
+    return frame.groupby("date")[columns].rank(pct=True) * 2 - 1
 
 
 def fit_models(train):
@@ -31,7 +39,9 @@ def fit_models(train):
         model.fit(train[FEATURES], train.target)
     ridge = make_pipeline(StandardScaler(), Ridge(alpha=25))
     ridge.fit(train[RICH_FEATURES], train.target)
-    return models, ridge
+    cross = make_pipeline(StandardScaler(), Ridge(alpha=25))
+    cross.fit(cross_features(train), train.target)
+    return models, {"raw": ridge, "cross": cross}
 
 
 def predict(frame, models, ridge, weights):
@@ -41,7 +51,8 @@ def predict(frame, models, ridge, weights):
     frame["Uniform ensemble"] = sum(frame.groupby("date")[n].rank(pct=True) for n in models) / len(models)
     frame["Validation weighted"] = sum(weights[n] * frame.groupby("date")[n].rank(pct=True) for n in models)
     frame["weightedEstimate"] = sum(weights[n] * frame[n] for n in models)
-    frame["Rich Ridge"] = ridge.predict(frame[RICH_FEATURES])
+    frame["Rich Ridge"] = ridge["raw"].predict(frame[RICH_FEATURES])
+    frame["Cross-sectional Ridge"] = ridge["cross"].predict(cross_features(frame))
     frame["Risk managed"] = frame["Validation weighted"]
     frame["Momentum"] = frame.return20
     return frame

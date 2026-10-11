@@ -325,7 +325,7 @@ def run_research(config, root: Path, progress=lambda *_: None, loader=market_his
     news_picks = [r["symbol"] for r in rankings[:top_k]]
     ledger = resolve_ledger(root, frames)
     signal_date = max(str(latest_date.date()), datetime.now(ZoneInfo("Asia/Kolkata")).date().isoformat())
-    experiment = hashlib.sha256(json.dumps({"symbols": sorted(frames), "topK": top_k, "costBps": config["costBps"], "includeNews": config["includeNews"], "version": VERSION, "overlay": "freshness-v1", "audit": AUDIT_VERSION}, sort_keys=True).encode()).hexdigest()[:12]
+    experiment = hashlib.sha256(json.dumps({"symbols": sorted(frames), "topK": top_k, "costBps": config["costBps"], "includeNews": config["includeNews"], "version": VERSION, "overlay": "freshness-v1", "audit": AUDIT_VERSION, "years": config["years"]}, sort_keys=True).encode()).hexdigest()[:12]
     forecast_id = f"{experiment}-{signal_date}"
     if not any(p["id"] == forecast_id for p in ledger):
         ledger.append({"id": forecast_id, "createdAt": now, "signalDate": signal_date, "modelId": model_id, "experiment": experiment, "universe": sorted(frames), "pricePicks": price_picks, "newsPicks": news_picks, "costBps": config["costBps"], "status": "pending", "newsEnabled": bool(articles), "auditModelId": audit_id, "auditStrategy": audit["latest"]["strategy"], "auditWeights": {a["symbol"]: a["weight"] for a in audit["latest"]["allocations"]}, "auditExposure": audit["latest"]["exposure"]})
