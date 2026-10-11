@@ -250,6 +250,9 @@ def resolve_ledger(root, frames):
         if "auditWeights" in forecast:
             forecast["auditReturn"] = sum(w * actual[s] for s, w in forecast["auditWeights"].items()) - forecast["auditExposure"] * cost
 
+        if "policyWeights" in forecast:
+            forecast["policyReturn"] = sum(w * actual[s] for s, w in forecast["policyWeights"].items()) - forecast["policyExposure"] * cost
+
     return ledger
 
 
@@ -268,10 +271,11 @@ def run_research(config, root: Path, progress=lambda *_: None, loader=market_his
     top_k = min(config["topK"], len(frames))
     panel, _ = feature_panel(frames)
     from research.audit import AUDIT_VERSION
+    from research.policy import POLICY_VERSION
     import sklearn
     mature = panel.dropna(subset=["target", "labelEnd"])
     latest_date = panel.date.max()
-    code_hash = hashlib.sha256(Path(__file__).read_bytes() + Path(__file__).with_name("audit.py").read_bytes()).hexdigest()
+    code_hash = hashlib.sha256(Path(__file__).read_bytes() + Path(__file__).with_name("audit.py").read_bytes() + Path(__file__).with_name("policy.py").read_bytes()).hexdigest()
     history_hash = hashlib.sha256(pd.util.hash_pandas_object(panel.sort_values(["date", "symbol"]), index=False).values.tobytes()).hexdigest()
     analysis_key = hashlib.sha256(json.dumps({"history": history_hash, "code": code_hash, "years": config["years"], "topK": top_k, "costBps": config["costBps"], "version": VERSION, "audit": AUDIT_VERSION, "libraries": [np.__version__, pd.__version__, sklearn.__version__]}, sort_keys=True).encode()).hexdigest()
     analysis_path = root / "analyses" / f"{analysis_key}.json"
@@ -348,10 +352,10 @@ def run_research(config, root: Path, progress=lambda *_: None, loader=market_his
     news_picks = [r["symbol"] for r in rankings[:top_k]]
     ledger = resolve_ledger(root, frames)
     signal_date = max(str(latest_date.date()), datetime.now(ZoneInfo("Asia/Kolkata")).date().isoformat())
-    experiment = hashlib.sha256(json.dumps({"symbols": sorted(frames), "topK": top_k, "costBps": config["costBps"], "includeNews": config["includeNews"], "version": VERSION, "overlay": "freshness-v1", "audit": AUDIT_VERSION, "years": config["years"]}, sort_keys=True).encode()).hexdigest()[:12]
+    experiment = hashlib.sha256(json.dumps({"symbols": sorted(frames), "topK": top_k, "costBps": config["costBps"], "includeNews": config["includeNews"], "version": VERSION, "overlay": "freshness-v1", "audit": AUDIT_VERSION, "policy": POLICY_VERSION, "years": config["years"]}, sort_keys=True).encode()).hexdigest()[:12]
     forecast_id = f"{experiment}-{signal_date}"
     if not any(p["id"] == forecast_id for p in ledger):
-        ledger.append({"id": forecast_id, "createdAt": now, "signalDate": signal_date, "modelId": model_id, "experiment": experiment, "universe": sorted(frames), "pricePicks": price_picks, "newsPicks": news_picks, "costBps": config["costBps"], "status": "pending", "newsEnabled": bool(articles), "auditModelId": audit_id, "auditStrategy": audit["latest"]["strategy"], "auditWeights": {a["symbol"]: a["weight"] for a in audit["latest"]["allocations"]}, "auditExposure": audit["latest"]["exposure"]})
+        ledger.append({"id": forecast_id, "createdAt": now, "signalDate": signal_date, "modelId": model_id, "experiment": experiment, "universe": sorted(frames), "pricePicks": price_picks, "newsPicks": news_picks, "costBps": config["costBps"], "status": "pending", "newsEnabled": bool(articles), "auditModelId": audit_id, "auditStrategy": audit["latest"]["strategy"], "auditWeights": {a["symbol"]: a["weight"] for a in audit["latest"]["allocations"]}, "auditExposure": audit["latest"]["exposure"], "policyVersion": POLICY_VERSION, "policyWeights": {a["symbol"]: a["weight"] for a in audit["policy"]["latest"]["allocations"]}, "policyExposure": audit["policy"]["latest"]["exposure"]})
     ledger = ledger[-500:]
     atomic_json(root / "forecasts.json", ledger)
     if articles:

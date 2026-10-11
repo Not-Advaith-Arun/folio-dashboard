@@ -60,6 +60,16 @@ class ResearchWorkflow(unittest.TestCase):
             audit = first["audit"]
             self.assertEqual(len(audit["metrics"]), 9)
             self.assertEqual(len(audit["costStress"]), 5)
+            policy = audit["policy"]
+            self.assertEqual(policy["version"], "absolute-risk-1")
+            self.assertEqual(len(policy["metrics"]), 4)
+            self.assertEqual(policy["periods"] + 1, len(policy["curve"]))
+            self.assertLessEqual(policy["activeWindows"], policy["periods"])
+            for m in policy["metrics"]:
+                self.assertAlmostEqual(policy["curve"][-1][m["name"]] - 1, m["totalReturn"])
+            self.assertAlmostEqual(sum(a["weight"] for a in policy["latest"]["allocations"]), policy["latest"]["exposure"])
+            self.assertTrue(all(a["weight"] <= .4 for a in policy["latest"]["allocations"]))
+            self.assertAlmostEqual(policy["latest"]["exposure"] + policy["latest"]["cashWeight"], 1)
             self.assertAlmostEqual(sum(a["weight"] for a in audit["latest"]["allocations"]), audit["latest"]["exposure"])
             for fold in audit["folds"]:
                 self.assertLess(fold["innerTrainLastOutcome"], fold["tuningStart"])
@@ -88,6 +98,21 @@ class ResearchWorkflow(unittest.TestCase):
             changed = run(perturbed)
             for field in ["selected", "weights", "candidates", "intervalRadius", "selectionBlocks"]:
                 self.assertEqual(changed["audit"]["folds"][0][field], audit["folds"][0][field])
+            # Critical financial property: future outcome labels cannot affect sizing;
+            # relative scores cannot force investment through a negative market gate.
+            from research.policy import allocation
+            from research.engine import feature_panel
+            panel = feature_panel({s: source(s, 3, root) for s in SYMBOLS})[0]
+            day = panel[panel.date == panel.date.max()].copy()
+            day["Cross-sectional Ridge"] = np.arange(len(day))
+            day["return60"] = .1; day["trend200"] = .1; day["marketTrend"] = .1
+            before = allocation(day, 2)
+            self.assertGreater(before[1]["exposure"], 0)
+            day["actual"] = 1000; day["target"] = -1000
+            self.assertEqual(allocation(day, 2), before)
+            day["marketTrend"] = -1
+            self.assertEqual(allocation(day, 2)[0], {})
+            self.assertEqual(allocation(day, 2)[1]["exposure"], 0)
             exported = json.loads((root / "latest.json").read_text())
             self.assertEqual(exported, changed)
             self.assertNotEqual(changed["dataFingerprint"], first["dataFingerprint"])
@@ -120,6 +145,8 @@ class ResearchWorkflow(unittest.TestCase):
             self.assertAlmostEqual(old["priceReturn"], actual)
             audit_actual = sum(w * (source(s, 3, root).loc[old["exitDate"], "open"] / source(s, 3, root).loc[old["entryDate"], "open"] - 1) for s, w in old["auditWeights"].items()) - old["auditExposure"] * .002
             self.assertAlmostEqual(old["auditReturn"], audit_actual)
+            policy_actual = sum(w * (source(s, 3, root).loc[old["exitDate"], "open"] / source(s, 3, root).loc[old["entryDate"], "open"] - 1) for s, w in old["policyWeights"].items()) - old["policyExposure"] * .002
+            self.assertAlmostEqual(old["policyReturn"], policy_actual)
             self.assertTrue(any("overlap" in w for w in resolved["warnings"]))
 
     def test_local_access_invalid_input_and_full_job(self):
