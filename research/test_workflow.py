@@ -67,6 +67,15 @@ class ResearchWorkflow(unittest.TestCase):
                 self.assertLess(fold["finalTrainLastOutcome"], fold["calibrationStart"])
                 self.assertLess(fold["calibrationLastOutcome"], fold["testStart"])
                 self.assertAlmostEqual(sum(fold["weights"].values()), 1)
+                self.assertLess(fold["tuningLastOutcome"], fold["selectionStart"])
+                self.assertEqual(len(fold["selectionBlocks"]), 2)
+                for block in fold["selectionBlocks"]:
+                    self.assertLess(block["lastTrainingOutcome"], block["start"])
+                    self.assertLess(block["lastOutcome"], block["end"])
+                    self.assertGreater(block["periods"], 0)
+                for candidate in fold["candidates"]:
+                    scores = [next(m["selectionScore"] for m in b["metrics"] if m["name"] == candidate["name"]) for b in fold["selectionBlocks"]]
+                    self.assertEqual(candidate["selectionScore"], min(scores))
             # Perturb future evaluation prices: the first fold's development choices
             # must remain identical. This guards the central financial leakage risk.
             source = fixture_loader()
@@ -77,7 +86,7 @@ class ResearchWorkflow(unittest.TestCase):
                 frame.loc[mask, ["open", "high", "low", "close"]] *= np.linspace(1, 1.2, int(mask.sum()))[:, None]
                 return frame
             changed = run(perturbed)
-            for field in ["selected", "weights", "candidates", "intervalRadius"]:
+            for field in ["selected", "weights", "candidates", "intervalRadius", "selectionBlocks"]:
                 self.assertEqual(changed["audit"]["folds"][0][field], audit["folds"][0][field])
             exported = json.loads((root / "latest.json").read_text())
             self.assertEqual(exported, changed)

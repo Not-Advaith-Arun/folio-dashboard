@@ -14,7 +14,7 @@ from sklearn.preprocessing import StandardScaler
 
 from research.engine import FEATURES, HORIZON, estimators, performance, rank_ic
 
-AUDIT_VERSION = "nested-audit-2"
+AUDIT_VERSION = "nested-audit-3"
 RICH_FEATURES = [*FEATURES, "return1", "return10", "return120", "relative20", "trend200", "marketTrend", "marketVol"]
 CANDIDATES = ["Uniform ensemble", "Validation weighted", "Rich Ridge", "Cross-sectional Ridge", "Risk managed", "Momentum", "Cash"]
 REFERENCES = [
@@ -94,11 +94,11 @@ def validation_score(returns):
 
 def development(train, top_k, cost_bps):
     dates = sorted(train.date.unique())
-    if len(dates) < 160:
+    if len(dates) < 210:
         raise ValueError("Not enough history for nested tuning and calibration.")
-    tune_start, calibration_start = pd.Timestamp(dates[-84]), pd.Timestamp(dates[-21])
+    tune_start, selection_start, second_start, calibration_start = [pd.Timestamp(dates[i]) for i in [-147, -105, -63, -21]]
     inner_train = train[train.labelEnd < tune_start]
-    tune = train[(train.date >= tune_start) & (train.labelEnd < calibration_start)]
+    tune = train[(train.date >= tune_start) & (train.labelEnd < selection_start)]
     if len(inner_train.date.unique()) < 60:
         raise ValueError("Not enough purged inner training dates.")
     models, ridge = fit_models(inner_train)
@@ -109,12 +109,26 @@ def development(train, top_k, cost_bps):
     probabilities /= probabilities.sum()
     # Shrink towards uniform to avoid a noisy short validation window dominating.
     weights = {n: float(.5 / len(models) + .5 * p) for n, p in zip(models, probabilities)}
-    development_predictions = predict(tune, models, ridge, weights)
+    # Weight learning is disjoint from strategy selection. Each selection block
+    # uses models refitted on outcomes strictly available before that block.
+    blocks, candidate_returns, candidate_scores = [], {n: [] for n in CANDIDATES}, {n: [] for n in CANDIDATES}
+    for start, end in [(selection_start, second_start), (second_start, calibration_start)]:
+        block_train = train[train.labelEnd < start]
+        block_test = train[(train.date >= start) & (train.labelEnd < end)]
+        block_models, block_ridge = fit_models(block_train)
+        predicted = predict(block_test, block_models, block_ridge, weights)
+        metrics = []
+        for name in CANDIDATES:
+            returns, _ = strategy_returns(predicted, name, top_k, cost_bps)
+            candidate_returns[name].extend(returns)
+            score = validation_score(returns)
+            candidate_scores[name].append(score)
+            metrics.append({"name": name, "selectionScore": score, **performance(returns)})
+        blocks.append({"start": str(start.date()), "end": str(end.date()), "lastTrainingOutcome": str(block_train.labelEnd.max().date()), "lastOutcome": str(block_test.labelEnd.max().date()), "periods": len(returns), "metrics": metrics})
     scores = []
     for name in CANDIDATES:
-        returns, _ = strategy_returns(development_predictions, name, top_k, cost_bps)
-        scores.append({"name": name, "selectionScore": validation_score(returns), **performance(returns)})
-    selected = max(scores, key=lambda x: x["selectionScore"])["name"]
+        scores.append({"name": name, "selectionScore": min(candidate_scores[name]), **performance(candidate_returns[name])})
+    selected = max(scores, key=lambda x: (x["selectionScore"], x["name"] == "Cash"))["name"]
     # Refit only before calibration; the calibration block is not training data.
     final_train = train[train.labelEnd < calibration_start]
     final_models, final_ridge = fit_models(final_train)
@@ -123,7 +137,7 @@ def development(train, top_k, cost_bps):
     errors = np.abs(calibration_predictions.target - calibration_predictions.weightedEstimate)
     radius = float(np.quantile(errors, .9, method="higher"))
     return final_models, final_ridge, weights, selected, radius, {
-        "innerTrainLastOutcome": str(inner_train.labelEnd.max().date()), "tuningStart": str(tune_start.date()), "tuningLastOutcome": str(tune.labelEnd.max().date()), "calibrationStart": str(calibration_start.date()), "finalTrainLastOutcome": str(final_train.labelEnd.max().date()), "calibrationLastOutcome": str(calibration.labelEnd.max().date()), "weights": weights, "selected": selected, "candidates": scores, "intervalRadius": radius,
+        "innerTrainLastOutcome": str(inner_train.labelEnd.max().date()), "tuningStart": str(tune_start.date()), "tuningLastOutcome": str(tune.labelEnd.max().date()), "selectionStart": str(selection_start.date()), "selectionBlocks": blocks, "calibrationStart": str(calibration_start.date()), "finalTrainLastOutcome": str(final_train.labelEnd.max().date()), "calibrationLastOutcome": str(calibration.labelEnd.max().date()), "weights": weights, "selected": selected, "candidates": scores, "intervalRadius": radius,
     }
 
 
@@ -195,6 +209,6 @@ def run_audit(panel, top_k, cost_bps, progress):
     benchmark_performance = performance(returns["Equal weight"])
     # Diagnostic gate only; selection has already happened using development data.
     supported = selected_performance["totalReturn"] > benchmark_performance["totalReturn"] and confidence["lower"] > 0
-    report = {"version": AUDIT_VERSION, "selectionRule": "Development net return minus half absolute drawdown; outer evaluation never selects models.", "historicalStatus": "Previously viewed historical evaluation; prospective confirmation required.", "folds": folds, "metrics": metrics, "curve": curve, "costStress": stress, "excessMeanInterval": confidence, "intervalCoverage": interval_coverage, "nominalIntervalCoverage": .9, "gate": "Historical evidence supports further paper testing" if supported else "No reliable historical advantage; keep paper-only", "latest": {"strategy": selected, "weights": weights, "exposure": exposure, "cashWeight": max(0.0, 1 - exposure), "allocations": proposal, "development": live_audit}, "references": REFERENCES, "limitations": ["Candidate rules are adaptations of research ideas, not replications of the cited studies.", "The historical evaluation was viewed during baseline work; it is not a fresh sealed holdout.", "Uncertainty bands are empirical residual bands with measured coverage, not distribution-free guarantees for dependent market data.", "Four hundred moving-block resamples describe sampling uncertainty; they do not correct survivorship bias or researcher selection.", "Cash assumes zero interest. Costs charge the full invested exposure each window rather than estimating exact turnover.", "Selected pipeline is frozen within each fold; candidate comparisons are diagnostics and cannot choose a winner using evaluation returns."]}
+    report = {"version": AUDIT_VERSION, "selectionRule": "Weights learned separately; select by worst of two purged development blocks (net return minus half absolute drawdown), with cash winning ties. Outer results never select models.", "historicalStatus": "Previously viewed historical evaluation; prospective confirmation required.", "folds": folds, "metrics": metrics, "curve": curve, "costStress": stress, "excessMeanInterval": confidence, "intervalCoverage": interval_coverage, "nominalIntervalCoverage": .9, "gate": "Historical evidence supports further paper testing" if supported else "No reliable historical advantage; keep paper-only", "latest": {"strategy": selected, "weights": weights, "exposure": exposure, "cashWeight": max(0.0, 1 - exposure), "allocations": proposal, "development": live_audit}, "references": REFERENCES, "limitations": ["Candidate rules are adaptations of research ideas, not replications of the cited studies.", "The historical evaluation was viewed during baseline work; it is not a fresh sealed holdout.", "Uncertainty bands are empirical residual bands with measured coverage, not distribution-free guarantees for dependent market data.", "Four hundred moving-block resamples describe sampling uncertainty; they do not correct survivorship bias or researcher selection.", "Cash assumes zero interest. Costs charge the full invested exposure each window rather than estimating exact turnover.", "Selected pipeline is frozen within each fold; candidate comparisons are diagnostics and cannot choose a winner using evaluation returns."]}
 
     return report, {"models": models, "ridge": ridge, "features": RICH_FEATURES, "weights": weights, "selected": selected, "intervalRadius": radius, "version": AUDIT_VERSION}
