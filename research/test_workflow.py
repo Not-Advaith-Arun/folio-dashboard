@@ -1,4 +1,4 @@
-"""Two spanning workflows: dated research/outcomes and local API security.
+"""Three spanning workflows: capital/discovery, research/outcomes, API security.
 
 Synthetic prices and sentiment are explicit offline fixtures, never production
 fallbacks. Calculation timing and access control warrant these critical checks.
@@ -86,7 +86,7 @@ class ResearchWorkflow(unittest.TestCase):
             replay({"A": frame}, [window, window], 1000.)
         # Discovery must not silently promote SME/dummy index securities to the
         # ordinary one-share execution workflow. These are explicit offline CSVs.
-        from research.universe import build_registry, daily_snapshot
+        from research.universe import build_registry, daily_snapshot, sme_band_snapshot
         main = "SYMBOL,NAME OF COMPANY,SERIES,DATE OF LISTING,MARKET LOT,ISIN NUMBER\nA,Alpha,EQ,01-JAN-2020,1,INE000A01001\n"
         sme = "SYMBOL,NAME_OF_COMPANY,SERIES,DATE_OF_LISTING,ISIN_NUMBER\nB,Beta,SM,01-Jan-24,INE000B01001\n"
         index = "Company Name,Industry,Symbol,Series,ISIN Code\nAlpha,Capital Goods,A,EQ,INE000A01001\nDummy,Dummy,DUMMY,EQ,DUM00000001\n"
@@ -111,6 +111,19 @@ class ResearchWorkflow(unittest.TestCase):
             daily_snapshot(daily, registry, "2024-12-30", "2025-01-01T00:00:00Z")
         with self.assertRaisesRegex(ValueError, "follow the trading date"):
             daily_snapshot(daily, registry, "2025-01-02", "2025-01-01T00:00:00Z")
+        band_csv = "Symbol,Series,Name,Band,Remarks\nB,SM,Beta,5,-\nB,ST,Beta,2,Restriction\n"
+        bands = sme_band_snapshot(band_csv, registry, "sme_bands_complete_31122024.csv", "2024-12-31", "2025-01-01T00:00:00Z")
+        self.assertEqual(bands["coverage"]["matchedSecurities"], 1)
+        self.assertEqual(bands["coverage"]["unmatchedRows"], 1)
+        self.assertEqual(bands["bands"][1]["remarks"], "Restriction")
+        self.assertIsNone(beta["listings"][0]["marketLot"])
+        self.assertFalse(beta["investmentEligible"])
+        with self.assertRaisesRegex(ValueError, "filename/date mismatch"):
+            sme_band_snapshot(band_csv, registry, "sme_bands_complete_01012025.csv", "2024-12-31", "2025-01-01T00:00:00Z")
+        with self.assertRaisesRegex(ValueError, "Future"):
+            sme_band_snapshot(band_csv, registry, "sme_bands_complete_02012025.csv", "2025-01-02", "2025-01-01T00:00:00Z")
+        with self.assertRaisesRegex(ValueError, "Invalid SME band percent"):
+            sme_band_snapshot(band_csv.replace(",5,", ",nan,"), registry, "sme_bands_complete_31122024.csv", "2024-12-31", "2025-01-01T00:00:00Z")
 
     def test_train_export_repeat_and_resolve_future_outcomes(self):
         with tempfile.TemporaryDirectory() as folder:

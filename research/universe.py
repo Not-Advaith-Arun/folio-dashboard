@@ -185,3 +185,56 @@ def daily_snapshot(text, registry, trading_date, observed_at):
                             "Daily file lacks ISIN: joins use exact symbols/series in the current master and are not historical identity proof.",
                             "Missing rows may reflect another series, no trade, suspension, separate SME file or other cause; never inferred as zero returns.",
                             "Price bars are not corporate-action-adjusted total returns. No spreads or intraday executable quotes included."]}
+
+
+def sme_band_snapshot(text, registry, source_filename, effective_date, observed_at):
+    """Retain dated published price bands without inferring market lots/fills.
+
+    The file has no internal date: provenance comes from its official dated name.
+    Current-master joins are not historical identity or surveillance verification.
+    """
+    effective = datetime.strptime(effective_date, "%Y-%m-%d").date()
+    observed = datetime.fromisoformat(observed_at.replace("Z", "+00:00"))
+    if source_filename != f"sme_bands_complete_{effective:%d%m%Y}.csv":
+        raise ValueError("SME band filename/date mismatch")
+    if observed.tzinfo is None or effective > observed.date():
+        raise ValueError("Future or undated SME band observation")
+    records = rows(text)
+    if not records or not {"SYMBOL", "SERIES", "NAME", "BAND", "REMARKS"}.issubset(records[0]):
+        raise ValueError("Missing SME band columns")
+    lookup = {}
+    for security in registry["securities"]:
+        for listing in security["listings"]:
+            if listing["segment"] != "sme":
+                continue
+            key = (listing["symbol"], listing["series"])
+            if key in lookup and lookup[key] != security["isin"]:
+                raise ValueError("Ambiguous SME identity")
+            lookup[key] = security["isin"]
+    seen, bands, unmatched = set(), [], []
+    for row in records:
+        key = (row["SYMBOL"], row["SERIES"])
+        if not re.fullmatch(r"[A-Z0-9&.\-]{1,40}", key[0]) or not key[1] or not row["NAME"]:
+            raise ValueError("Invalid SME band identity")
+        if key in seen:
+            raise ValueError("Duplicate SME band symbol/series")
+        seen.add(key)
+        band = float(row["BAND"])
+        if not math.isfinite(band) or not 0 < band <= 100:
+            raise ValueError("Invalid SME band percent")
+        isin = lookup.get(key)
+        record = {"symbol": key[0], "series": key[1], "isin": isin, "bandPercent": band,
+                  "remarks": row["REMARKS"], "effectiveDate": effective_date}
+        bands.append(record)
+        if isin is None:
+            unmatched.append({"symbol": key[0], "series": key[1], "reason": "No exact current SME-master match"})
+    matched = {b["isin"] for b in bands if b["isin"]}
+    return {"version": UNIVERSE_VERSION, "effectiveDate": effective_date, "observedAt": observed_at,
+            "sourceFilename": source_filename, "dateProvenance": "official filename; no internal date",
+            "sourceSha256": hashlib.sha256(text.encode()).hexdigest(), "bands": bands, "unmatched": unmatched,
+            "coverage": {"sourceRows": len(records), "matchedSecurities": len(matched),
+                         "unmatchedRows": len(unmatched), "bandCounts": dict(Counter(str(b["bandPercent"]) for b in bands))},
+            "limitations": ["Published price-band percentage does not establish exact executable limits, fills or liquidity.",
+                            "Market lots and surveillance status are absent; no investment eligibility is granted.",
+                            "Downloaded now; no claim that this file was available before historical decisions.",
+                            "Exact current symbol/series join is not point-in-time identity verification."]}
