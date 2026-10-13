@@ -4,6 +4,7 @@ Synthetic prices and sentiment are explicit offline fixtures, never production
 fallbacks. Calculation timing and access control warrant these critical checks.
 """
 import json
+import hashlib
 import tempfile
 import time
 import unittest
@@ -99,6 +100,46 @@ class ResearchWorkflow(unittest.TestCase):
         self.assertEqual(q.loc[sessions[449], "labelStatus"], "unavailable_future_path")
         self.assertFalse(q.loc[sessions[449], "featureReady"])
         self.assertFalse(quarantine.investmentEligible.any())
+        # Reviewed calendar corrections derive new inputs; first-seen source
+        # knowledge and original bars must survive through panel/export.
+        from research.reconcile import exclude_closed_sessions
+        evidence = b"Offline synthetic closure notice; not an exchange circular"
+        digest = hashlib.sha256(evidence).hexdigest()
+        observed = datetime.now(timezone.utc)
+        notice = {"market": "NSE:CM", "closedSession": str(sessions[230].date()),
+                  "publishedDate": str((sessions[230] - timedelta(days=3)).date()),
+                  "observedAt": observed.isoformat(), "sourceUrl": "https://example.com/fixture",
+                  "sourceSha256": digest, "sourceKind": "captured-excerpt", "reason": "Offline holiday fixture"}
+        kwargs = {"market": "NSE:CM", "market_timezone": "Asia/Kolkata",
+                  "knowledge_as_of": observed.isoformat(), "sources": {digest: evidence}}
+        originals = {s: f.copy(deep=True) for s, f in frames.items()}
+        corrected, calendar, ledger = exclude_closed_sessions(frames, sessions, [notice], **kwargs)
+        self.assertNotIn(sessions[230], calendar)
+        self.assertEqual(len(calendar), len(sessions) - 1)
+        for symbol in frames:
+            pd.testing.assert_frame_equal(originals[symbol], frames[symbol])
+            pd.testing.assert_frame_equal(corrected[symbol], originals[symbol].drop(sessions[230]))
+        self.assertEqual(sum(len(s["excludedRows"]) for s in ledger["securities"]), 2)
+        again, same_calendar, repeated = exclude_closed_sessions(corrected, calendar, [notice], **kwargs)
+        self.assertTrue(same_calendar.equals(calendar))
+        self.assertEqual(repeated["notices"][0]["status"], "already_absent")
+        for symbol in corrected:
+            pd.testing.assert_frame_equal(corrected[symbol], again[symbol])
+        resolved_panel, _ = session_panel(corrected, calendar, calendar_source="Reviewed fixture closure",
+                                           price_basis="Synthetic adjusted research prices")
+        previous = resolved_panel[(resolved_panel.symbol == SYMBOLS[0]) & (resolved_panel.date == sessions[229])].iloc[0]
+        self.assertEqual(previous.entryDate, sessions[231])
+        self.assertEqual(previous.labelEnd, sessions[236])
+        self.assertEqual(previous.labelStatus, "observed")
+        for bad_notice, bad_kwargs, message in [
+            (notice, {**kwargs, "sources": {digest: b"tampered"}}, "source hash"),
+            (notice, {**kwargs, "knowledge_as_of": (observed - timedelta(seconds=1)).isoformat()}, "knowledge cutoff"),
+            ({**notice, "market": "NYSE"}, kwargs, "input market"),
+        ]:
+            with self.assertRaisesRegex(ValueError, message):
+                exclude_closed_sessions(frames, sessions, [bad_notice], **bad_kwargs)
+        with self.assertRaisesRegex(ValueError, "Duplicate closure"):
+            exclude_closed_sessions(frames, sessions, [notice, notice], **kwargs)
         with self.assertRaisesRegex(ValueError, "Explicit sorted unique"):
             session_panel(frames, sessions[::-1], calendar_source="fixture", price_basis="fixture")
         with tempfile.TemporaryDirectory() as directory:
@@ -111,6 +152,8 @@ class ResearchWorkflow(unittest.TestCase):
             self.assertIsNone(missing_bar["actual"])
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
             json.dumps(artifact, allow_nan=False)
+            atomic_json(Path(directory) / "correction-ledger.json", ledger)
+            self.assertEqual(json.loads((Path(directory) / "correction-ledger.json").read_text()), ledger)
 
     def test_whole_share_cash_cost_split_and_daily_replay(self):
         # A spanning execution workflow protects critical money identities,
