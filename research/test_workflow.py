@@ -84,6 +84,43 @@ class ResearchWorkflow(unittest.TestCase):
             replay({"A": bad}, [window], 1000.)
         with self.assertRaisesRegex(ValueError, "Overlapping"):
             replay({"A": frame}, [window, window], 1000.)
+        from research.rebalance import replay_rebalanced
+        flat = frame.copy()
+        flat[["open", "high", "low", "close"]] = 100.
+        flat[["splits", "dividends"]] = 0.
+        decisions = [{"signal": w["signal"], "entry": w["entry"], "weights": w["weights"]} for w in [window, second]]
+        retained = replay_rebalanced({"A": flat}, decisions, dates[-1], {"A": 1}, 1000., 0.)
+        self.assertEqual([(o["side"], o["units"]) for o in retained["orders"]], [("buy", 9), ("sell", 9)])
+        halves = [{**w, "weights": {"A": .5}} for w in [window, second]]
+        half_retained = replay_rebalanced({"A": flat}, halves, dates[-1], {"A": 1}, 10000., 0.)
+        self.assertLess(half_retained["fees"], replay({"A": flat}, halves, 10000., 0.)["fees"])
+        self.assertAlmostEqual(retained["ending"], 1000. - retained["fees"])
+        rotation = [decisions[0], {**decisions[1], "weights": {"B": 1.}}]
+        rotated = replay_rebalanced({"A": flat, "B": flat}, rotation, dates[-1], {"A": 1, "B": 1}, 1000., 0.)
+        self.assertFalse(any(o["symbol"] == "B" for o in rotated["orders"]))
+        self.assertEqual(rotated["unfilledTargets"][-1]["filledUnits"], 0)
+        self.assertGreater(rotated["curve"][3]["unsettled"], 0)
+        lots = replay_rebalanced({"A": flat}, decisions, dates[-1], {"A": 10}, 2000., 0.)
+        self.assertTrue(all(o["units"] % 10 == 0 for o in lots["orders"]))
+        unaffordable_lot = replay_rebalanced({"A": flat}, decisions, dates[-1], {"A": 10}, 1000., 0.)
+        self.assertEqual(unaffordable_lot["orders"], [])
+        tiny_change = [decisions[0], {**decisions[1], "weights": {"A": .91}}]
+        banded = replay_rebalanced({"A": flat}, tiny_change, dates[-1], {"A": 1}, 10000., 0., .1)
+        self.assertGreater(banded["suppressedAdjustments"], 0)
+        self.assertEqual(len(banded["orders"]), 2)  # Final liquidation ignores drift band.
+        split_retained = replay_rebalanced({"A": frame}, decisions, dates[-1], {"A": 1}, 1000., 0.)
+        changed_retained = replay_rebalanced({"A": changed}, decisions, dates[-1], {"A": 1}, 1000., 0.)
+        self.assertEqual(split_retained["orders"][:-1], changed_retained["orders"][:-1])
+        self.assertEqual(split_retained["omittedDividendEntitlements"], 18.)
+        for point in split_retained["curve"]:
+            self.assertAlmostEqual(point["equity"], point["cash"] + point["unsettled"] + point["invested"])
+        with self.assertRaisesRegex(ValueError, "Explicit positive integer lot"):
+            replay_rebalanced({"A": flat}, decisions, dates[-1], {"A": None})
+        with self.assertRaisesRegex(ValueError, "Invalid or duplicate decision timing"):
+            replay_rebalanced({"A": flat}, [decisions[0], decisions[0]], dates[-1], {"A": 1})
+        no_trades = flat.copy(); no_trades.loc[dates[0], "volume"] = 0
+        with self.assertRaisesRegex(ValueError, "zero-volume"):
+            replay_rebalanced({"A": no_trades}, decisions, dates[-1], {"A": 1})
         # Discovery must not silently promote SME/dummy index securities to the
         # ordinary one-share execution workflow. These are explicit offline CSVs.
         from research.universe import build_registry, daily_snapshot, sme_band_snapshot

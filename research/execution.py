@@ -27,39 +27,14 @@ def charges(value, side):
     return brokerage + exchange + sebi_ipft + dp + gst + value * .001 + (value * .00015 if side == "buy" else 0.)
 
 
-def replay(frames, windows, initial=100000., slippage_bps=5.):
-    """Replay disjoint frozen target windows; sale proceeds available next session.
-
-    Windows contain signal/entry/exit and long-only target weights. Liquidate at
-    each exit open; on a coincident next entry only previously settled cash may
-    be spent. No same-open sale recycling or borrowing. Splits adjust units;
-    dividends are omitted conservatively, so this is not a total-return result.
-    """
-    if not math.isfinite(initial) or initial <= 0 or not math.isfinite(slippage_bps) or not 0 <= slippage_bps <= 100:
-        raise ValueError("Invalid capital or slippage")
-    if not frames or not windows:
-        raise ValueError("Prices and frozen windows required")
+def validated_calendar(frames, start, end):
+    """Strict shared raw-price/action validation for both execution policies."""
     calendar = sorted(set.intersection(*(set(f.index) for f in frames.values())))
-    start, end = pd.Timestamp(windows[0]["entry"]), pd.Timestamp(windows[-1]["exit"])
     dates = [d for d in calendar if start <= d <= end]
     if not dates or dates[0] != start or dates[-1] != end:
         raise ValueError("Missing execution boundary")
     if any(list(f.loc[start:end].index) != dates for f in frames.values()):
         raise ValueError("Mismatched execution calendars; no silent missing-session fills")
-    entries, exits = {}, set()
-    previous_exit = None
-    for w in windows:
-        signal, entry, exit_date = map(pd.Timestamp, (w["signal"], w["entry"], w["exit"]))
-        weights = w["weights"]
-        if not signal < entry < exit_date or entry not in dates or exit_date not in dates or (previous_exit is not None and entry < previous_exit):
-            raise ValueError("Overlapping windows or invalid execution timing")
-        if any(s not in frames or not math.isfinite(v) or v < 0 for s, v in weights.items()) or sum(weights.values()) > 1 + 1e-9:
-            raise ValueError("Invalid long-only allocation")
-        if entry in entries:
-            raise ValueError("Duplicate entry")
-        entries[entry] = weights
-        exits.add(exit_date)
-        previous_exit = exit_date
     for symbol, f in frames.items():
         if f.index.has_duplicates or not f.index.is_monotonic_increasing:
             raise ValueError(f"Invalid dates: {symbol}")
@@ -74,6 +49,37 @@ def replay(frames, windows, initial=100000., slippage_bps=5.):
                 raise ValueError("Invalid corporate action")
             if not math.isfinite(row.volume) or row.volume < 0:
                 raise ValueError("Invalid volume")
+    return dates
+
+
+def replay(frames, windows, initial=100000., slippage_bps=5.):
+    """Replay disjoint frozen target windows; sale proceeds available next session.
+
+    Windows contain signal/entry/exit and long-only target weights. Liquidate at
+    each exit open; on a coincident next entry only previously settled cash may
+    be spent. No same-open sale recycling or borrowing. Splits adjust units;
+    dividends are omitted conservatively, so this is not a total-return result.
+    """
+    if not math.isfinite(initial) or initial <= 0 or not math.isfinite(slippage_bps) or not 0 <= slippage_bps <= 100:
+        raise ValueError("Invalid capital or slippage")
+    if not frames or not windows:
+        raise ValueError("Prices and frozen windows required")
+    start, end = pd.Timestamp(windows[0]["entry"]), pd.Timestamp(windows[-1]["exit"])
+    dates = validated_calendar(frames, start, end)
+    entries, exits = {}, set()
+    previous_exit = None
+    for w in windows:
+        signal, entry, exit_date = map(pd.Timestamp, (w["signal"], w["entry"], w["exit"]))
+        weights = w["weights"]
+        if not signal < entry < exit_date or entry not in dates or exit_date not in dates or (previous_exit is not None and entry < previous_exit):
+            raise ValueError("Overlapping windows or invalid execution timing")
+        if any(s not in frames or not math.isfinite(v) or v < 0 for s, v in weights.items()) or sum(weights.values()) > 1 + 1e-9:
+            raise ValueError("Invalid long-only allocation")
+        if entry in entries:
+            raise ValueError("Duplicate entry")
+        entries[entry] = weights
+        exits.add(exit_date)
+        previous_exit = exit_date
     cash, pending, held = float(initial), 0., {}
     curve = [{"date": str(start.date()), "phase": "before-entry", "equity": initial, "cash": initial, "unsettled": 0., "invested": 0.}]
     orders, fees, omitted_dividends = [], 0., 0.
