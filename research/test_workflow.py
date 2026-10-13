@@ -1,4 +1,4 @@
-"""Three spanning workflows: capital/discovery, research/outcomes, API security.
+"""Spanning workflows: capital/discovery, session data, research, API security.
 
 Synthetic prices and sentiment are explicit offline fixtures, never production
 fallbacks. Calculation timing and access control warrant these critical checks.
@@ -46,6 +46,72 @@ def fixture_scores(articles):
 
 
 class ResearchWorkflow(unittest.TestCase):
+    def test_session_data_readiness_leakage_and_export(self):
+        # Missing-data selection and label timing are critical financial
+        # boundaries. Test source -> readiness/labels -> local artifact together.
+        from research.engine import feature_panel, atomic_json
+        from research.panel import session_panel, panel_payload, STOCK_FEATURES
+        source = fixture_loader()
+        frames = {s: source(s, 3, None).iloc[:460] for s in SYMBOLS[:2]}
+        sessions = next(iter(frames.values())).index
+        build = lambda f: session_panel(f, sessions, calendar_source="Explicit offline fixture sessions",
+                                         price_basis="Synthetic adjusted research prices")
+        base, coverage = build(frames)
+        self.assertEqual(coverage["featureReadyRows"], (460 - 199) * 2)
+        legacy = feature_panel(frames)[0].set_index(["symbol", "date"])
+        ready = base[base.featureReady].set_index(["symbol", "date"])
+        np.testing.assert_allclose(ready[STOCK_FEATURES], legacy.loc[ready.index, STOCK_FEATURES])
+        short = {**frames, "NEW": frames[SYMBOLS[0]].iloc[-80:]}
+        with_new, _ = build(short)
+        pd.testing.assert_frame_equal(base, with_new[with_new.symbol != "NEW"].reset_index(drop=True))
+        self.assertFalse(with_new[with_new.symbol == "NEW"].featureReady.any())
+        missing = {**frames, SYMBOLS[1]: frames[SYMBOLS[1]].drop(sessions[230])}
+        sparse, sparse_coverage = build(missing)
+        pd.testing.assert_frame_equal(base[base.symbol == SYMBOLS[0]], sparse[sparse.symbol == SYMBOLS[0]])
+        b = sparse[sparse.symbol == SYMBOLS[1]].set_index("date")
+        self.assertTrue(b.loc[sessions[229], "featureReady"])
+        self.assertEqual(b.loc[sessions[229], "labelStatus"], "unavailable_future_path")
+        self.assertEqual(b.loc[sessions[229], "entryDate"], sessions[230])
+        self.assertEqual(b.loc[sessions[229], "labelEnd"], sessions[235])
+        self.assertTrue(pd.isna(b.loc[sessions[229], "actual"]))
+        self.assertTrue(pd.isna(b.loc[sessions[230], "open"]))
+        self.assertFalse(b.loc[sessions[231:430], "featureReady"].any())
+        self.assertTrue(b.loc[sessions[430], "featureReady"])
+        self.assertTrue(b.iloc[-1].featureReady)
+        self.assertEqual(b.iloc[-1].labelStatus, "pending_future_sessions")
+        changed = {s: f.copy() for s, f in frames.items()}
+        changed[SYMBOLS[0]].loc[sessions[300]:, ["open", "high", "low", "close"]] *= 1.5
+        future, _ = build(changed)
+        cols = ["date", "symbol", *STOCK_FEATURES, "featureReady", "featureStatus"]
+        pd.testing.assert_frame_equal(base.loc[base.date < sessions[300], cols],
+                                      future.loc[future.date < sessions[300], cols])
+        damaged = {s: f.copy() for s, f in frames.items()}
+        damaged[SYMBOLS[1]].loc[sessions[250], "high"] = 1
+        damaged[SYMBOLS[1]].loc[sessions[450], "volume"] = 0
+        damaged["DUPLICATE"] = pd.concat([frames[SYMBOLS[0]], frames[SYMBOLS[0]].iloc[-1:]])
+        quarantine, details = build(damaged)
+        statuses = {s["symbol"]: s for s in details["securities"]}
+        self.assertEqual(statuses[SYMBOLS[1]]["invalidRows"], [str(sessions[250].date())])
+        self.assertIsNotNone(statuses["DUPLICATE"]["securityQuarantine"])
+        self.assertEqual(statuses["DUPLICATE"]["featureReadyRows"], 0)
+        q = quarantine[quarantine.symbol == SYMBOLS[1]].set_index("date")
+        self.assertEqual(q.loc[sessions[450], "featureStatus"], "zero_volume")
+        self.assertEqual(q.loc[sessions[449], "labelStatus"], "unavailable_future_path")
+        self.assertFalse(q.loc[sessions[449], "featureReady"])
+        self.assertFalse(quarantine.investmentEligible.any())
+        with self.assertRaisesRegex(ValueError, "Explicit sorted unique"):
+            session_panel(frames, sessions[::-1], calendar_source="fixture", price_basis="fixture")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "session-panel.json"
+            atomic_json(path, panel_payload(sparse, sparse_coverage))
+            artifact = json.loads(path.read_text())
+            self.assertEqual(len(artifact["rows"]), len(sparse))
+            missing_bar = next(r for r in artifact["rows"] if r["symbol"] == SYMBOLS[1] and r["date"] == str(sessions[230].date()))
+            self.assertIsNone(missing_bar["open"])
+            self.assertIsNone(missing_bar["actual"])
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            json.dumps(artifact, allow_nan=False)
+
     def test_whole_share_cash_cost_split_and_daily_replay(self):
         # A spanning execution workflow protects critical money identities,
         # corporate actions and settlement; it is not a narrow estimator test.
