@@ -5,9 +5,11 @@ fallbacks. Calculation timing and access control warrant these critical checks.
 """
 import json
 import hashlib
+import io
 import tempfile
 import time
 import unittest
+import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -334,6 +336,50 @@ class ResearchWorkflow(unittest.TestCase):
             sme_band_snapshot(band_csv, registry, "sme_bands_complete_02012025.csv", "2025-01-02", "2025-01-01T00:00:00Z")
         with self.assertRaisesRegex(ValueError, "Invalid SME band percent"):
             sme_band_snapshot(band_csv.replace(",5,", ",nan,"), registry, "sme_bands_complete_31122024.csv", "2024-12-31", "2025-01-01T00:00:00Z")
+        # Dated exchange identity must survive independently of current survivors.
+        # ZIP/date/scope controls protect the source-to-private-artifact workflow.
+        from research.dated_universe import udiff_snapshot
+        from research.engine import atomic_json
+        member = "BhavCopy_NSE_CM_0_0_0_20241231_F_0000.csv"
+        header = "TradDt,BizDt,Sgmt,Src,FinInstrmTp,FinInstrmId,ISIN,TckrSymb,SctySrs,OpnPric,HghPric,LwPric,ClsPric,TtlTradgVol,TtlTrfVal,SsnId,NewBrdLotQty\n"
+        good = "2024-12-31,2024-12-31,CM,NSE,STK,1,INE009A01021,A,EQ,100,105,95,102,100,10200,F1,\n"
+        historical = "2024-12-31,2024-12-31,CM,NSE,STK,2,INE002A01018,C,SM,100,105,95,102,2000,204000,F1,1000\n"
+        bad_price = "2024-12-31,2024-12-31,CM,NSE,STK,3,IN0020200104,D,EQ,100,1,95,102,100,10200,F1,1\n"
+        bad_isin = "2024-12-31,2024-12-31,CM,NSE,STK,4,INE009A01020,E,EQ,100,105,95,102,100,10200,F1,1\n"
+        def zipped(body, name=member):
+            stream = io.BytesIO()
+            with zipfile.ZipFile(stream, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr(name, body)
+            return stream.getvalue()
+        payload = zipped(header + good + historical + bad_price + bad_isin)
+        dated = udiff_snapshot(payload, member + ".zip", "2024-12-31", "2025-01-01T00:00:00Z")
+        self.assertEqual(dated["coverage"]["auditedRows"], 2)
+        self.assertEqual(dated["coverage"]["quarantinedRows"], 2)
+        self.assertEqual(dated["coverage"]["datedIdentities"], 3)
+        self.assertEqual(next(r for r in dated["identities"] if r["symbol"] == "D")["priceStatus"], "quarantined")
+        self.assertEqual(dated["coverage"]["missingReportedLots"], 1)
+        self.assertEqual(dated["sourceSha256"], hashlib.sha256(payload).hexdigest())
+        old = next(r for r in dated["bars"] if r["symbol"] == "C")
+        self.assertEqual(old["isin"], "INE002A01018")
+        self.assertEqual(old["reportedBoardLot"], 1000)
+        self.assertNotIn("C", {l["symbol"] for s in registry["securities"] for l in s["listings"]})
+        self.assertTrue(all(not r["investmentEligible"] for r in dated["bars"]))
+        for data, name, observed, message in [
+            (payload, member.replace("20241231", "20241230") + ".zip", "2025-01-01T00:00:00Z", "filename/date"),
+            (payload, member + ".zip", "2024-12-30T00:00:00Z", "precede"),
+            (zipped(header + good, "../" + member), member + ".zip", "2025-01-01T00:00:00Z", "matching"),
+            (zipped("0" * 10_000_001), member + ".zip", "2025-01-01T00:00:00Z", "oversized"),
+            (zipped(header + good + good), member + ".zip", "2025-01-01T00:00:00Z", "Duplicate"),
+            (zipped((header + good).replace(",NSE,", ",BSE,")), member + ".zip", "2025-01-01T00:00:00Z", "scope"),
+            (zipped((header + good).replace("2024-12-31", "2024-12-30")), member + ".zip", "2025-01-01T00:00:00Z", "different"),
+        ]:
+            with self.assertRaisesRegex(ValueError, message):
+                udiff_snapshot(data, name, "2024-12-31", observed)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "dated-universe.json"
+            atomic_json(path, dated)
+            self.assertEqual(json.loads(path.read_text()), dated)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
     def test_train_export_repeat_and_resolve_future_outcomes(self):
         with tempfile.TemporaryDirectory() as folder:
