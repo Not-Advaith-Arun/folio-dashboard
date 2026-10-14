@@ -140,6 +140,68 @@ class ResearchWorkflow(unittest.TestCase):
                 exclude_closed_sessions(frames, sessions, [bad_notice], **bad_kwargs)
         with self.assertRaisesRegex(ValueError, "Duplicate closure"):
             exclude_closed_sessions(frames, sessions, [notice, notice], **kwargs)
+        # Official raw/adjusted reconciliation flows through quarantine, rolling
+        # readiness, fixed label endpoints and the same private artifact export.
+        from research.reconcile import quarantine_bhavcopy_conflicts
+        day = sessions[240]
+        compared = {s: f.copy() for s, f in frames.items()}
+        compared[SYMBOLS[1]].loc[day, "volume"] = 0
+        compared.update({"NO_OFFICIAL": frames[SYMBOLS[0]].copy(),
+                         "NO_PROVIDER": frames[SYMBOLS[0]].drop(day),
+                         "BAD_OFFICIAL": frames[SYMBOLS[0]].copy()})
+        mappings = {s: {"symbol": name, "series": "EQ"} for s, name in zip(
+            compared, ["ALPHA", "BETA", "ABSENT", "EMPTY", "INVALID"])}
+        lines = ["SYMBOL,SERIES,DATE1,OPEN_PRICE,HIGH_PRICE,LOW_PRICE,CLOSE_PRICE,TTL_TRD_QNTY,TURNOVER_LACS"]
+        for symbol, name in [(SYMBOLS[0], "ALPHA"), (SYMBOLS[1], "BETA")]:
+            row = frames[symbol].loc[day]
+            # A uniform factor must not be mistaken for proof of bad prices.
+            values = [row[k] * 2 for k in ["open", "high", "low", "close"]]
+            lines.append(",".join(map(str, [name, "EQ", day.strftime("%d-%b-%Y"), *values, int(row.volume), 10])))
+        lines.append(f"INVALID,EQ,{day:%d-%b-%Y},100,90,80,95,1000,10")
+        raw_csv = "\n".join(lines).encode()
+        daily_source = {"market": "NSE:CM", "tradingDate": str(day.date()),
+                        "observedAt": observed.isoformat(), "url": "https://example.com/offline-bhavcopy",
+                        "sha256": hashlib.sha256(raw_csv).hexdigest()}
+        daily_kwargs = {"knowledge_as_of": observed.isoformat(), "price_basis": "Offline adjusted fixture"}
+        before = {s: f.copy() for s, f in compared.items()}
+        isolated, audit = quarantine_bhavcopy_conflicts(compared, mappings, daily_source, raw_csv, **daily_kwargs)
+        self.assertEqual(audit["quarantinedRows"], 1)
+        statuses = {r["symbol"]: r for r in audit["comparisons"]}
+        self.assertEqual(statuses[SYMBOLS[0]]["status"], "compatible_unverified")
+        self.assertEqual(statuses[SYMBOLS[0]]["closeScaleDiagnostic"], 0.5)
+        self.assertEqual(statuses[SYMBOLS[1]]["reasons"], ["zero_volume_conflict"])
+        for symbol, status in [("NO_OFFICIAL", "official_missing"), ("NO_PROVIDER", "provider_missing"),
+                               ("BAD_OFFICIAL", "official_invalid")]:
+            self.assertEqual(statuses[symbol]["status"], status)
+        for symbol in compared:
+            pd.testing.assert_frame_equal(compared[symbol], before[symbol])
+            if symbol != SYMBOLS[1]:
+                pd.testing.assert_frame_equal(isolated[symbol], before[symbol])
+        isolated_panel, _ = build(isolated)
+        b = isolated_panel[isolated_panel.symbol == SYMBOLS[1]].set_index("date")
+        self.assertTrue(b.loc[day, ["open", "high", "low", "close", "volume"]].isna().all())
+        self.assertFalse(b.loc[sessions[240:440], "featureReady"].any())
+        self.assertTrue(b.loc[sessions[440], "featureReady"])
+        self.assertTrue(b.loc[sessions[239], "featureReady"])
+        self.assertEqual(b.loc[sessions[239], "labelStatus"], "unavailable_future_path")
+        self.assertEqual(b.loc[sessions[239], "entryDate"], day)
+        self.assertEqual(b.loc[sessions[239], "labelEnd"], sessions[245])
+        pd.testing.assert_frame_equal(base[base.symbol == SYMBOLS[0]].reset_index(drop=True),
+                                      isolated_panel[isolated_panel.symbol == SYMBOLS[0]].reset_index(drop=True))
+        distorted = {s: f.copy() for s, f in compared.items()}
+        distorted[SYMBOLS[0]].loc[day, "high"] *= 1.02
+        _, shape_audit = quarantine_bhavcopy_conflicts(distorted, mappings, daily_source, raw_csv, **daily_kwargs)
+        shape_record = next(r for r in shape_audit["comparisons"] if r["symbol"] == SYMBOLS[0])
+        self.assertIn("ohlc_shape_conflict", shape_record["reasons"])
+        for bad_bytes, options, message in [
+            (raw_csv + b"tampered", daily_kwargs, "source hash"),
+            (raw_csv, {**daily_kwargs, "knowledge_as_of": (observed - timedelta(seconds=1)).isoformat()}, "knowledge cutoff"),
+        ]:
+            with self.assertRaisesRegex(ValueError, message):
+                quarantine_bhavcopy_conflicts(compared, mappings, daily_source, bad_bytes, **options)
+        with self.assertRaisesRegex(ValueError, "unambiguous"):
+            quarantine_bhavcopy_conflicts(compared, {**mappings, SYMBOLS[1]: mappings[SYMBOLS[0]]},
+                                         daily_source, raw_csv, **daily_kwargs)
         with self.assertRaisesRegex(ValueError, "Explicit sorted unique"):
             session_panel(frames, sessions[::-1], calendar_source="fixture", price_basis="fixture")
         with tempfile.TemporaryDirectory() as directory:
@@ -154,6 +216,8 @@ class ResearchWorkflow(unittest.TestCase):
             json.dumps(artifact, allow_nan=False)
             atomic_json(Path(directory) / "correction-ledger.json", ledger)
             self.assertEqual(json.loads((Path(directory) / "correction-ledger.json").read_text()), ledger)
+            atomic_json(Path(directory) / "source-audit.json", audit)
+            self.assertEqual(json.loads((Path(directory) / "source-audit.json").read_text()), audit)
 
     def test_whole_share_cash_cost_split_and_daily_replay(self):
         # A spanning execution workflow protects critical money identities,
