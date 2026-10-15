@@ -375,11 +375,67 @@ class ResearchWorkflow(unittest.TestCase):
         ]:
             with self.assertRaisesRegex(ValueError, message):
                 udiff_snapshot(data, name, "2024-12-31", observed)
+        # Source archives -> dated histories -> explicit-session readiness ->
+        # private export. Identity/timing/gap distinctions are critical to avoid
+        # survivorship and false continuity in later financial calculations.
+        from research.dated_history import udiff_histories
+        from research.panel import session_panel, panel_payload
+        first_archive = {"payload": payload, "filename": member + ".zip", "tradingDate": "2024-12-31",
+                         "observedAt": "2025-01-01T00:00:00Z", "sha256": hashlib.sha256(payload).hexdigest(),
+                         "sourceUrl": "https://example.com/offline-fixture"}
+        next_member = member.replace("20241231", "20250102")
+        next_body = (header + good.replace(",STK,1,", ",STK,10,").replace(",A,EQ,", ",AA,EQ,")
+                     .replace(",F1,\n", ",F1,5\n") + historical.replace(",C,SM,", ",C,ST,")
+                     + bad_price.replace(",D,EQ,", ",A,EQ,").replace(",100,1,95,", ",100,105,95,"))
+        next_bytes = zipped(next_body.replace("2024-12-31", "2025-01-02"), next_member)
+        next_archive = {**first_archive, "payload": next_bytes, "filename": next_member + ".zip",
+                        "tradingDate": "2025-01-02", "observedAt": "2025-01-03T00:00:00Z",
+                        "sha256": hashlib.sha256(next_bytes).hexdigest()}
+        days = ["2024-12-31", "2025-01-01", "2025-01-02"]
+        build_history = lambda sources: udiff_histories(sources, days, knowledge_as_of="2025-01-03T00:00:00Z",
+                                                      calendar_source="Explicit offline fixture dates")
+        histories, ledger = build_history([next_archive, first_archive])
+        again_frames, again_ledger = build_history([first_archive, next_archive])
+        self.assertEqual(ledger, again_ledger)
+        for key, frame in histories.items():
+            pd.testing.assert_frame_equal(frame, again_frames[key])
+        self.assertEqual(ledger["missingFileDates"], ["2025-01-01"])
+        self.assertEqual(ledger["coverage"]["statusCounts"], {
+            "observed": 5, "quarantined_price": 1, "missing_file": 4, "not_observed_in_file": 2})
+        self.assertEqual(ledger["coverage"]["histories"], 4)
+        self.assertEqual(ledger["aliasIdentityConflicts"][0]["symbol"], "A")
+        self.assertEqual(ledger["multipleSeriesIsins"], [{"isin": "INE002A01018", "series": ["SM", "ST"]}])
+        self.assertTrue(any(c["changes"].get("reportedBoardLot") == {"before": None, "after": 5}
+                            for c in ledger["observedChanges"]))
+        self.assertEqual(ledger["sources"][0]["quarantined"], dated["quarantined"])
+        panel, coverage = session_panel(histories, pd.DatetimeIndex(days),
+                                        calendar_source=ledger["calendarSource"], price_basis="Unadjusted offline fixture")
+        self.assertEqual(coverage["featureReadyRows"], 0)
+        self.assertEqual(len(panel), 12)
+        self.assertFalse(panel.investmentEligible.any())
+        self.assertEqual(panel.featureStatus.eq("invalid_ohlcv").sum(), 1)
+        self.assertEqual(panel.featureStatus.eq("missing_observation").sum(), 6)
+        self.assertTrue(panel.loc[panel.date.eq("2025-01-01"), "close"].isna().all())
+        ambiguous_bytes = zipped(header + good + good.replace(",STK,1,", ",STK,9,").replace(",A,EQ,", ",Z,EQ,"))
+        for sources, message in [
+            ([first_archive, first_archive], "duplicate/revised"),
+            ([{**first_archive, "sha256": "0" * 64}], "hash differs"),
+            ([{**first_archive, "observedAt": "2025-01-04T00:00:00Z"}], "knowledge cutoff"),
+            ([{**first_archive, "tradingDate": "2024-12-30"}], "Outside requested"),
+            ([{**first_archive, "payload": ambiguous_bytes, "sha256": hashlib.sha256(ambiguous_bytes).hexdigest()}], "Ambiguous same-day"),
+        ]:
+            with self.assertRaisesRegex(ValueError, message):
+                build_history(sources)
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "dated-universe.json"
             atomic_json(path, dated)
             self.assertEqual(json.loads(path.read_text()), dated)
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            artifact = {"history": ledger, "panel": panel_payload(panel, coverage)}
+            history_path = Path(directory) / "dated-history.json"
+            atomic_json(history_path, artifact)
+            self.assertEqual(json.loads(history_path.read_text()), artifact)
+            self.assertEqual(history_path.stat().st_mode & 0o777, 0o600)
 
     def test_train_export_repeat_and_resolve_future_outcomes(self):
         with tempfile.TemporaryDirectory() as folder:
