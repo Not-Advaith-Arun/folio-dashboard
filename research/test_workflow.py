@@ -463,12 +463,44 @@ class ResearchWorkflow(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "History knowledge"):
             reconcile_symbol_changes(history_bytes, history_hash, [], {}, knowledge_as_of="2025-01-02T00:00:00Z")
         self.assertEqual(json.dumps(ledger, sort_keys=True).encode(), history_bytes)
+        # Reference-close equality explains a series-specific observation; it
+        # must not turn a quarantined T0 bar into an ordinary executable close.
+        from research.reconcile import audit_t0_reference_closes
+        t0 = good.replace(",STK,1,", ",STK,7,").replace(",EQ,", ",T0,")
+        t0 = t0.replace(",100,105,95,102,", ",110,110,110,102.0000,")
+        def audit_series(body):
+            data = zipped(header + body)
+            source = {**first_archive, "payload": data, "sha256": hashlib.sha256(data).hexdigest()}
+            return audit_t0_reference_closes(source, knowledge_as_of="2025-01-03T00:00:00Z"), source
+        series_evidence, series_source = audit_series(good + t0)
+        record = series_evidence["records"][0]
+        self.assertEqual(record["status"], "matched_reference_close")
+        self.assertEqual(record["identity"]["priceStatus"], "quarantined")
+        self.assertFalse(record["ordinaryPriceContractSupported"])
+        self.assertFalse(record["investmentEligible"] or record["historicalRuleApplicabilityVerified"])
+        self.assertEqual(len(series_evidence["sourceQuarantines"]), 1)
+        for body, status in [
+            (good + t0.replace("102.0000", "102.0000000000000001"), "close_mismatch"),
+            (good.replace(",EQ,", ",BE,") + t0, "reference_missing"),
+            (good.replace(",F1,", ",F2,") + t0, "reference_missing"),
+            (good + good.replace(",STK,1,", ",STK,8,").replace(",A,EQ,", ",Z,EQ,") + t0,
+             "reference_ambiguous"),
+            (good.replace(",A,EQ,", ",Z,EQ,") + t0, "symbol_conflict"),
+            (good.replace(",100,105,95,", ",100,1,95,") + t0, "reference_quarantined"),
+            (good + t0.replace("102.0000", "NaN"), "invalid_close"),
+        ]:
+            self.assertEqual(audit_series(body)[0]["records"][0]["status"], status)
+        with self.assertRaisesRegex(ValueError, "hash differs"):
+            audit_t0_reference_closes({**series_source, "sha256": "0" * 64}, knowledge_as_of="2025-01-03T00:00:00Z")
+        with self.assertRaisesRegex(ValueError, "knowledge cutoff"):
+            audit_t0_reference_closes(series_source, knowledge_as_of="2024-12-31T00:00:00Z")
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "dated-universe.json"
             atomic_json(path, dated)
             self.assertEqual(json.loads(path.read_text()), dated)
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
-            artifact = {"history": ledger, "panel": panel_payload(panel, coverage), "aliasEvidence": evidence}
+            artifact = {"history": ledger, "panel": panel_payload(panel, coverage),
+                        "aliasEvidence": evidence, "seriesEvidence": series_evidence}
             history_path = Path(directory) / "dated-history.json"
             atomic_json(history_path, artifact)
             self.assertEqual(json.loads(history_path.read_text()), artifact)

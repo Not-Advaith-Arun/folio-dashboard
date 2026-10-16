@@ -1,14 +1,17 @@
-"""Versioned, evidence-bound data reconciliation. Never alter original inputs.
+"""Evidence-bound calendar, identity and price diagnostics preserving originals.
 
-This removes reviewed closures from a supplied observation calendar; it does
-not certify the other dates as exchange sessions or reconcile price adjustments.
+Each audit establishes only its stated scope, never complete investment eligibility.
 """
 from __future__ import annotations
 
+import csv
 import hashlib
+import io
 import json
 import math
+import zipfile
 from collections import Counter
+from decimal import Decimal, InvalidOperation
 from datetime import date, datetime
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
@@ -17,10 +20,12 @@ import pandas as pd
 
 from research.panel import PRICE_COLUMNS, daily_index
 from research.universe import daily_snapshot
+from research.dated_universe import udiff_snapshot
 
 CORRECTION_VERSION = "calendar-exclusion-1"
 BAR_AUDIT_VERSION = "source-reconciliation-1"
 ALIAS_EVIDENCE_VERSION = "alias-evidence-1"
+T0_REFERENCE_VERSION = "t0-reference-close-1"
 
 
 def _instant(value):
@@ -45,6 +50,77 @@ def _frame_hash(frame):
 
 def _calendar_hash(sessions):
     return hashlib.sha256("\n".join(sessions.strftime("%Y-%m-%d")).encode()).hexdigest()
+
+
+def audit_t0_reference_closes(archive, *, knowledge_as_of):
+    """Compare dated T0 closes with unique same-ISIN/session EQ candidates.
+
+    NSE's March 2024 T0 FAQ describes a corresponding T+1 reference close.
+    EQ is an explicit candidate here, not an inferred map for every T+1 series.
+    Exact source-decimal equality is only consistency evidence: it never repairs
+    OHLC, releases quarantine or verifies historical rule applicability/fills.
+    Reviewed rule documents belong in the caller's separate evidence lineage.
+    """
+    cutoff = _instant(knowledge_as_of)
+    if _instant(archive["observedAt"]) > cutoff:
+        raise ValueError("Daily source exceeds audit knowledge cutoff")
+    payload = archive["payload"]
+    if not isinstance(payload, bytes) or hashlib.sha256(payload).hexdigest() != archive["sha256"]:
+        raise ValueError("Daily source hash differs from acquisition record")
+    url = urlparse(archive["sourceUrl"])
+    if url.scheme != "https" or not url.netloc:
+        raise ValueError("Reviewed daily source URL required")
+    snapshot = udiff_snapshot(payload, archive["filename"], archive["tradingDate"], archive["observedAt"])
+    # The parser above already enforces one exact member, input bounds, date,
+    # scope and duplicate IDs. Re-read those same bytes for exact decimal values.
+    with zipfile.ZipFile(io.BytesIO(payload)) as zipped:
+        rows = list(csv.DictReader(io.StringIO(zipped.read(zipped.namelist()[0]).decode("utf-8-sig"))))
+    raw = {(r["FinInstrmId"].strip(), r["SsnId"].strip()): r for r in rows}
+    references = {}
+    for identity in snapshot["identities"]:
+        if identity["series"] == "EQ":
+            references.setdefault((identity["isin"], identity["session"]), []).append(identity)
+    records = []
+    for identity in snapshot["identities"]:
+        if identity["series"] != "T0":
+            continue
+        row = raw[(identity["instrumentId"], identity["session"])]
+        candidates = references.get((identity["isin"], identity["session"]), [])
+        record = {"identity": dict(identity), "closeRaw": row["ClsPric"].strip(),
+                  "referenceCandidates": [dict(c) for c in candidates], "referenceCloseRaw": None,
+                  "status": "reference_missing", "ordinaryPriceContractSupported": False,
+                  "historicalRuleApplicabilityVerified": False, "investmentEligible": False}
+        if len(candidates) > 1:
+            record["status"] = "reference_ambiguous"
+        elif candidates:
+            reference = candidates[0]
+            value = raw[(reference["instrumentId"], reference["session"])]["ClsPric"].strip()
+            record["referenceCloseRaw"] = value
+            if reference["symbol"] != identity["symbol"]:
+                record["status"] = "symbol_conflict"
+            elif reference["priceStatus"] != "structurally_valid":
+                record["status"] = "reference_quarantined"
+            else:
+                try:
+                    actual, expected = Decimal(record["closeRaw"]), Decimal(value)
+                    if not actual.is_finite() or not expected.is_finite() or min(actual, expected) <= 0:
+                        raise InvalidOperation
+                    record["status"] = "matched_reference_close" if actual == expected else "close_mismatch"
+                except InvalidOperation:
+                    record["status"] = "invalid_close"
+        records.append(record)
+    return {"version": T0_REFERENCE_VERSION, "knowledgeAsOf": cutoff.isoformat(),
+            "tradingDate": snapshot["tradingDate"], "sourceSha256": snapshot["sourceSha256"],
+            "csvSha256": snapshot["csvSha256"], "sourceUrl": archive["sourceUrl"],
+            "observedAt": archive["observedAt"], "records": records,
+            "sourceQuarantines": snapshot["quarantined"],
+            "coverage": {"t0Identities": len(records),
+                         "statusCounts": dict(Counter(r["status"] for r in records))},
+            "limitations": ["Close equality does not validate other price/volume fields or release any quarantine.",
+                            "EQ candidates use same-day ISIN/session and symbol; missing/ambiguous matches stay unresolved.",
+                            "Historical rule applicability and later amendments require separately reviewed evidence.",
+                            "T0 reference close is not an independently executable T0 closing price.",
+                            "Original data, ordinary price contracts and investment eligibility are unchanged."]}
 
 
 def reconcile_symbol_changes(history_bytes, history_sha256, notices, sources, *, knowledge_as_of):
