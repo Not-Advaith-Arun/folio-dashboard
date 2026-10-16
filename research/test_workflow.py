@@ -426,12 +426,49 @@ class ResearchWorkflow(unittest.TestCase):
         ]:
             with self.assertRaisesRegex(ValueError, message):
                 build_history(sources)
+        # Reviewed official facts may explain a symbol change but cannot confer
+        # price continuity, resolve lots/IDs, fill gaps or backdate availability.
+        from research.reconcile import reconcile_symbol_changes
+        history_bytes = json.dumps(ledger, sort_keys=True).encode()
+        history_hash = hashlib.sha256(history_bytes).hexdigest()
+        excerpt = b"Offline reviewed symbol-change fixture, not an exchange notice."
+        excerpt_hash = hashlib.sha256(excerpt).hexdigest()
+        notice = {"market": "NSE:CM", "oldSymbol": "A", "newSymbol": "AA", "circularId": "fixture-1",
+                  "publishedDate": "2024-12-30", "effectiveDate": "2025-01-02", "observedAt": "2025-01-03T00:00:00Z",
+                  "sourceKind": "captured-excerpt", "sourceUrl": "https://example.com/offline-fixture",
+                  "sourceSha256": excerpt_hash}
+        audit_aliases = lambda notes: reconcile_symbol_changes(
+            history_bytes, history_hash, notes, {excerpt_hash: excerpt}, knowledge_as_of="2025-01-03T00:00:00Z")
+        evidence = audit_aliases([notice, {**notice, "oldSymbol": "X", "newSymbol": "Y", "circularId": "unused"}])
+        self.assertEqual(evidence["coverage"]["statusCounts"], {"supported": 1, "unresolved": 1})
+        self.assertEqual(evidence["coverage"]["unreviewedOtherChanges"], 1)
+        self.assertEqual(len(evidence["unusedNotices"]), 1)
+        self.assertTrue(next(r for r in evidence["changes"] if r["status"] == "supported")["effectiveDateObserved"])
+        self.assertTrue(all(not r["priceContinuityVerified"] and not r["investmentEligible"] for r in evidence["changes"]))
+        gap_evidence = audit_aliases([{**notice, "effectiveDate": "2025-01-01"}])
+        self.assertFalse(next(r for r in gap_evidence["changes"] if r["status"] == "supported")["effectiveDateObserved"])
+        self.assertIn("date_conflict", audit_aliases([{**notice, "effectiveDate": "2024-12-31"}])["coverage"]["statusCounts"])
+        for notes, message in [
+            ([notice, notice], "duplicate"),
+            ([{**notice, "sourceSha256": "0" * 64}], "hash"),
+            ([{**notice, "observedAt": "2025-01-04T00:00:00Z"}], "chronology"),
+            ([{**notice, "publishedDate": "2025-01-03"}], "chronology"),
+            ([{**notice, "market": "BSE:CM"}], "market"),
+            ([{**notice, "sourceKind": "unknown"}], "source kind"),
+        ]:
+            with self.assertRaisesRegex(ValueError, message):
+                audit_aliases(notes)
+        with self.assertRaisesRegex(ValueError, "History hash"):
+            reconcile_symbol_changes(history_bytes + b" ", history_hash, [], {}, knowledge_as_of="2025-01-03T00:00:00Z")
+        with self.assertRaisesRegex(ValueError, "History knowledge"):
+            reconcile_symbol_changes(history_bytes, history_hash, [], {}, knowledge_as_of="2025-01-02T00:00:00Z")
+        self.assertEqual(json.dumps(ledger, sort_keys=True).encode(), history_bytes)
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "dated-universe.json"
             atomic_json(path, dated)
             self.assertEqual(json.loads(path.read_text()), dated)
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
-            artifact = {"history": ledger, "panel": panel_payload(panel, coverage)}
+            artifact = {"history": ledger, "panel": panel_payload(panel, coverage), "aliasEvidence": evidence}
             history_path = Path(directory) / "dated-history.json"
             atomic_json(history_path, artifact)
             self.assertEqual(json.loads(history_path.read_text()), artifact)

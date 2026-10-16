@@ -20,6 +20,7 @@ from research.universe import daily_snapshot
 
 CORRECTION_VERSION = "calendar-exclusion-1"
 BAR_AUDIT_VERSION = "source-reconciliation-1"
+ALIAS_EVIDENCE_VERSION = "alias-evidence-1"
 
 
 def _instant(value):
@@ -44,6 +45,87 @@ def _frame_hash(frame):
 
 def _calendar_hash(sessions):
     return hashlib.sha256("\n".join(sessions.strftime("%Y-%m-%d")).encode()).hexdigest()
+
+
+def reconcile_symbol_changes(history_bytes, history_sha256, notices, sources, *, knowledge_as_of):
+    """Annotate dated-history symbol changes against manually reviewed notices.
+
+    This is a separate evidence ledger, never a price/identity rewrite. A notice
+    documents the literal symbol change only: ISINs come from dated observations,
+    and neither economic continuity nor historical first-seen news is certified.
+    The supplied history hash must come from the preserved artifact's lineage.
+    """
+    cutoff = _instant(knowledge_as_of)
+    if not isinstance(history_bytes, bytes) or hashlib.sha256(history_bytes).hexdigest() != history_sha256:
+        raise ValueError("History hash does not match preserved artifact")
+    history = json.loads(history_bytes)
+    if history["version"] != "dated-history-1":
+        raise ValueError("Supported dated-history artifact required")
+    if (_instant(history["knowledgeAsOf"]) > cutoff
+            or any(_instant(s["observedAt"]) > cutoff for s in history["sources"])):
+        raise ValueError("History knowledge exceeds reconciliation cutoff")
+    reviewed = {}
+    for notice in notices:
+        old, new = notice["oldSymbol"], notice["newSymbol"]
+        if (notice["market"] != "NSE:CM" or not all(isinstance(s, str) and s.strip() == s and s for s in [old, new])
+                or old == new or not notice["circularId"].strip()):
+            raise ValueError("Explicit market, distinct symbols and circular identity required")
+        pair = (old, new)
+        if pair in reviewed or any(n["circularId"] == notice["circularId"] for n in reviewed.values()):
+            raise ValueError("Competing or duplicate notices require explicit review")
+        published, effective = _day(notice["publishedDate"]), _day(notice["effectiveDate"])
+        observed = _instant(notice["observedAt"])
+        if (observed > cutoff or published > effective
+                or published.date() > observed.astimezone(ZoneInfo("Asia/Kolkata")).date()):
+            raise ValueError("Invalid notice publication/acquisition chronology")
+        url = urlparse(notice["sourceUrl"])
+        if url.scheme != "https" or not url.netloc:
+            raise ValueError("Reviewed source URL required")
+        if notice["sourceKind"] not in {"original-document", "captured-excerpt"}:
+            raise ValueError("Explicit original-document or captured-excerpt source kind required")
+        evidence = sources.get(notice["sourceSha256"])
+        if not isinstance(evidence, bytes) or hashlib.sha256(evidence).hexdigest() != notice["sourceSha256"]:
+            raise ValueError("Notice evidence hash does not match captured bytes")
+        reviewed[pair] = dict(notice)
+
+    records, unreviewed_fields, used = [], [], set()
+    for change in history["observedChanges"]:
+        if other := {k: v for k, v in change["changes"].items() if k != "symbol"}:
+            unreviewed_fields.append({**change, "changes": other, "status": "unreviewed"})
+        symbols = change["changes"].get("symbol")
+        if symbols is None:
+            continue
+        pair = (symbols["before"], symbols["after"])
+        record = {"key": change["key"], "previousObservedDate": change["previousObservedDate"],
+                  "observedDate": change["observedDate"], "oldSymbol": pair[0], "newSymbol": pair[1],
+                  "status": "unresolved", "notice": None, "effectiveDateObserved": False,
+                  "priceContinuityVerified": False, "investmentEligible": False}
+        notice = reviewed.get(pair) if change["key"].startswith("NSE:CM:") else None
+        if notice:
+            used.add(pair)
+            record["notice"] = dict(notice)
+            effective = _day(notice["effectiveDate"])
+            before, after = _day(change["previousObservedDate"]), _day(change["observedDate"])
+            record["status"] = "supported" if before < effective <= after else "date_conflict"
+            record["effectiveDateObserved"] = record["status"] == "supported" and effective == after
+        records.append(record)
+    return {
+        "version": ALIAS_EVIDENCE_VERSION, "knowledgeAsOf": cutoff.isoformat(),
+        "inputHistorySha256": history_sha256, "changes": records,
+        "unreviewedOtherChanges": unreviewed_fields,
+        "unusedNotices": [n for pair, n in sorted(reviewed.items()) if pair not in used],
+        "coverage": {"symbolChanges": len(records), "reviewedNotices": len(reviewed),
+                     "statusCounts": dict(Counter(r["status"] for r in records)),
+                     "unreviewedOtherChanges": len(unreviewed_fields)},
+        "limitations": [
+            "Manually reviewed notice facts are hash-bound; no automatic PDF semantic extraction or signature verification.",
+            "Supported means observed symbols/date bracket agree with the notice, not verified corporate-action continuity.",
+            "ISIN, series and session remain dated-file observations; a symbol-only notice does not certify them.",
+            "Effective dates within observation gaps do not create missing prices or exact first-trade observations.",
+            "Actual acquisition is not historical first-seen availability; no backdated news or eligibility promotion.",
+            "Original histories and prices are not modified; all non-symbol changes remain unreviewed.",
+        ],
+    }
 
 
 def exclude_closed_sessions(frames, sessions, notices, *, market, market_timezone, knowledge_as_of, sources):
