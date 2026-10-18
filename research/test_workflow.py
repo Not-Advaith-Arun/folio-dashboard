@@ -54,6 +54,8 @@ class ResearchWorkflow(unittest.TestCase):
         # selection, private artifacts and unchanged-run reuse, not tree internals.
         from research.architecture import (SPEC, BOOKS, architecture_panel, fit_at,
                                            allocate, run_experiment, sha)
+        from research.normalized import (TARGET, BOOKS as NORMALIZED_BOOKS, normalize_panel,
+                                         fit_scaled, run_experiment as run_normalized)
         dates = pd.bdate_range("2020-01-01", periods=960)
         frames = {}
         for i in range(5):
@@ -87,6 +89,15 @@ class ResearchWorkflow(unittest.TestCase):
         pd.testing.assert_frame_equal(before[columns], after[columns])
         self.assertEqual(lineage, later_lineage)
         self.assertTrue(pd.isna(after[after.symbol == "FIXTURE1"].iloc[0].actual))
+        scaled_panel = normalize_panel(panel)
+        ready = panel.featureReady
+        np.testing.assert_allclose((scaled_panel.actual * scaled_panel.targetScale)[ready], panel.actual[ready], equal_nan=True)
+        self.assertTrue((scaled_panel.loc[ready, "targetScale"] >= .01).all())
+        scaled_before, scaled_lineage, _ = fit_scaled(panel, signal)
+        scaled_after, later_scaled_lineage, _ = fit_scaled(future, signal)
+        pd.testing.assert_frame_equal(scaled_before[columns + ["targetScale"]], scaled_after[columns + ["targetScale"]])
+        self.assertEqual(scaled_lineage, later_scaled_lineage)
+        np.testing.assert_allclose(scaled_before.actual, panel.loc[scaled_before.index, "actual"], equal_nan=True)
         for book in ["dual_head", "ensemble_mean_only", "ridge_mean_only", "trend"]:
             weights = allocate(before, book)
             self.assertEqual(weights, allocate(after, book))
@@ -123,11 +134,39 @@ class ResearchWorkflow(unittest.TestCase):
                 self.assertEqual(artifact.stat().st_mode & 0o777, 0o600)
             with patch("research.architecture.fit_at", side_effect=AssertionError("Unchanged run refitted")):
                 self.assertTrue(run_experiment(p)["cacheHit"])
+            # Reuse the frozen original books; change only target units. Verify
+            # a different observed result cannot silently replace that parent.
+            original_completion = root / "run/completed.json"
+            original_hash = sha(original_completion)
+            normalized_root = root / "normalized"
+            normalized_root.mkdir()
+            normalized_protocol = normalized_root / "protocol.json"
+            normalized_protocol.write_text(json.dumps({"target": TARGET, "books": list(NORMALIZED_BOOKS),
+                "frozenAt": datetime.now(timezone.utc).isoformat(),
+                "referenceProtocol": {"path": str(p), "sha256": sha(p)},
+                "referenceCompleted": {"path": str(original_completion), "sha256": original_hash}}))
+            normalized_result = run_normalized(normalized_protocol)
+            self.assertFalse(normalized_result["cacheHit"])
+            self.assertFalse(normalized_result["livePromotionAllowed"])
+            self.assertEqual(normalized_result["fitCount"], result["fitCount"])
+            self.assertEqual(normalized_result["predictionMetrics"]["count"], result["predictionMetrics"]["count"])
+            for slip, books in result["comparison"].items():
+                for book, expected in books.items():
+                    self.assertEqual(normalized_result["comparison"][slip][book], expected)
+            self.assertEqual(original_hash, sha(original_completion))
+            normalized_predictions = json.loads((normalized_root / "run/forecasts.json").read_text())
+            self.assertEqual(len(normalized_predictions), len(forecasts))
+            for artifact in (normalized_root / "run").iterdir():
+                self.assertEqual(artifact.stat().st_mode & 0o777, 0o600)
+            with patch("research.normalized.fit_scaled", side_effect=AssertionError("Repeated normalized fit")):
+                self.assertTrue(run_normalized(normalized_protocol)["cacheHit"])
             forecasts_path = root / "run/forecasts.json"
             original = forecasts_path.read_bytes()
             forecasts_path.write_text("[]")
             with self.assertRaisesRegex(ValueError, "artifact hash"):
                 run_experiment(p)
+            with self.assertRaisesRegex(ValueError, "Reference artifact hash"):
+                run_normalized(normalized_protocol)
             forecasts_path.write_bytes(original)
             source_path = Path(protocol["featureInputs"][0]["path"])
             source_path.write_text("[]")
