@@ -49,6 +49,91 @@ def fixture_scores(articles):
 
 
 class ResearchWorkflow(unittest.TestCase):
+    def test_architecture_training_allocation_replay_and_immutable_export(self):
+        # One spanning model workflow covers financial timing, future-data
+        # selection, private artifacts and unchanged-run reuse, not tree internals.
+        from research.architecture import (SPEC, BOOKS, architecture_panel, fit_at,
+                                           allocate, run_experiment, sha)
+        dates = pd.bdate_range("2020-01-01", periods=960)
+        frames = {}
+        for i in range(5):
+            rng = np.random.default_rng(400 + i)
+            close = 100 * np.exp(np.cumsum(rng.normal(.0003, .012, len(dates))))
+            frames[f"FIXTURE{i}"] = pd.DataFrame({"open": close * 1.001,
+                "high": close * (1 + rng.uniform(.005, .02, len(dates))),
+                "low": close * (1 - rng.uniform(.005, .02, len(dates))), "close": close,
+                "volume": rng.integers(50000, 100000, len(dates)), "splits": 0., "dividends": 0.}, index=dates)
+        adjusted = {s: f.copy() for s, f in frames.items()}
+        adjusted["FIXTURE0"].loc[dates[650], ["open", "high", "low", "close", "volume"]] = np.nan
+        build = lambda f: architecture_panel(f, dates, calendar_source="Explicit synthetic test sessions",
+                                             price_basis="Synthetic fixture only")
+        panel, coverage = build(adjusted)
+        self.assertEqual(coverage["holdingSessions"], 20)
+        self.assertFalse(panel.investmentEligible.any())
+        signal = dates[730]
+        before, lineage, _ = fit_at(panel, signal)
+        self.assertEqual(lineage["status"], "fitted")
+        self.assertLess(lineage["trainLastOutcome"], lineage["calibrationStart"])
+        self.assertLess(lineage["calibrationLastOutcome"], str(signal.date()))
+        self.assertNotIn("FIXTURE0", before.symbol.tolist())
+        self.assertEqual(before.iloc[0].labelEnd, dates[751])
+        changed = {s: f.copy() for s, f in adjusted.items()}
+        for f in changed.values():
+            f.loc[dates[731]:, ["open", "high", "low", "close"]] *= 2
+        changed["FIXTURE1"] = changed["FIXTURE1"].drop(dates[731])
+        future, _ = build(changed)
+        after, later_lineage, _ = fit_at(future, signal)
+        columns = ["symbol", "mean", "ridge", "tree", "q10"]
+        pd.testing.assert_frame_equal(before[columns], after[columns])
+        self.assertEqual(lineage, later_lineage)
+        self.assertTrue(pd.isna(after[after.symbol == "FIXTURE1"].iloc[0].actual))
+        for book in ["dual_head", "ensemble_mean_only", "ridge_mean_only", "trend"]:
+            weights = allocate(before, book)
+            self.assertEqual(weights, allocate(after, book))
+            self.assertLessEqual(sum(weights.values()), 1)
+            self.assertTrue(all(0 < w <= .25 for w in weights.values()))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            protocol = {"architecture": SPEC, "books": BOOKS, "signalStride": 20,
+                "frozenAt": datetime.now(timezone.utc).isoformat(), "calendarExcluded": [],
+                "calendarSource": "Synthetic dates", "priceBasis": "Synthetic prices",
+                "start": str(dates[700].date()), "end": str(dates[950].date()),
+                "lots": dict.fromkeys(frames, 1), "capital": 100000.,
+                "slippageScenarios": [0., 5., 10.], "primarySlippage": 5., "evidenceLimits": ["Fixture only"]}
+            for key, source in [("featureInputs", adjusted), ("executionInputs", frames)]:
+                protocol[key] = []
+                for s, frame in source.items():
+                    p = root / f"{key}-{s}.json"
+                    rows = frame.reset_index(names="date")
+                    rows["date"] = rows.date.dt.strftime("%Y-%m-%d")
+                    p.write_text(rows.to_json(orient="records"))
+                    protocol[key].append({"path": str(p), "sha256": sha(p), "symbol": s})
+            p = root / "protocol.json"
+            p.write_text(json.dumps(protocol))
+            result = run_experiment(p)
+            self.assertGreater(result["fitCount"], 0)
+            self.assertFalse(result["livePromotionAllowed"])
+            self.assertFalse(result["cacheHit"])
+            self.assertEqual(set(result["comparison"]["5.0"]), set(BOOKS))
+            self.assertEqual(result["comparison"]["5.0"]["cash"]["ending"], 100000.)
+            forecasts = json.loads((root / "run/forecasts.json").read_text())
+            self.assertEqual(len(forecasts), result["scheduledDecisions"] * len(frames))
+            self.assertTrue(any(r["mean"] is not None and r["actual"] is None for r in forecasts))
+            for artifact in (root / "run").iterdir():
+                self.assertEqual(artifact.stat().st_mode & 0o777, 0o600)
+            with patch("research.architecture.fit_at", side_effect=AssertionError("Unchanged run refitted")):
+                self.assertTrue(run_experiment(p)["cacheHit"])
+            forecasts_path = root / "run/forecasts.json"
+            original = forecasts_path.read_bytes()
+            forecasts_path.write_text("[]")
+            with self.assertRaisesRegex(ValueError, "artifact hash"):
+                run_experiment(p)
+            forecasts_path.write_bytes(original)
+            source_path = Path(protocol["featureInputs"][0]["path"])
+            source_path.write_text("[]")
+            with self.assertRaisesRegex(ValueError, "Source hash"):
+                run_experiment(p)
+
     def test_session_data_readiness_leakage_and_export(self):
         # Missing-data selection and label timing are critical financial
         # boundaries. Test source -> readiness/labels -> local artifact together.

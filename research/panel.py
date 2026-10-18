@@ -27,7 +27,7 @@ def daily_index(index):
             and index.equals(index.normalize()))
 
 
-def session_panel(frames, sessions, *, calendar_source, price_basis):
+def session_panel(frames, sessions, *, calendar_source, price_basis, horizon=HORIZON):
     """Return all security/session rows and a JSON-safe coverage manifest.
 
     Sessions must be supplied independently of the requested securities, through
@@ -36,6 +36,8 @@ def session_panel(frames, sessions, *, calendar_source, price_basis):
     disclose its source. Price adjustment/identity correctness is not established
     by structural checks, so investment eligibility is always false.
     """
+    if type(horizon) is not int or not 1 <= horizon <= 252:
+        raise ValueError("Holding horizon must be 1–252 explicit sessions.")
     if not frames or not all(isinstance(s, str) and s.strip() for s in frames):
         raise ValueError("Nonempty security identifiers required.")
     if not daily_index(sessions) or len(sessions) == 0:
@@ -43,7 +45,7 @@ def session_panel(frames, sessions, *, calendar_source, price_basis):
     if not all(isinstance(s, str) and s.strip() for s in [calendar_source, price_basis]):
         raise ValueError("Calendar source and price basis must be disclosed.")
     dates = pd.Series(sessions, index=sessions)
-    entry, end = dates.shift(-1), dates.shift(-(HORIZON + 1))
+    entry, end = dates.shift(-1), dates.shift(-(horizon + 1))
     panels, coverage = [], []
     for symbol, source in sorted(frames.items()):
         if not isinstance(source, pd.DataFrame):
@@ -93,8 +95,8 @@ def session_panel(frames, sessions, *, calendar_source, price_basis):
         # next observed bar or shorten the holding horizon by dropping dates.
         future_valid = valid & f.volume.gt(0)
         observed_path = pd.concat([future_valid.shift(-i, fill_value=False)
-                                  for i in range(1, HORIZON + 2)], axis=1).all(axis=1)
-        actual = f.open.shift(-(HORIZON + 1)) / f.open.shift(-1) - 1
+                                  for i in range(1, horizon + 2)], axis=1).all(axis=1)
+        actual = f.open.shift(-(horizon + 1)) / f.open.shift(-1) - 1
         finite_outcome = np.isfinite(actual)
         label_ready = valid & end.notna() & observed_path & finite_outcome
         x["entryDate"], x["labelEnd"] = entry, end
@@ -121,7 +123,7 @@ def session_panel(frames, sessions, *, calendar_source, price_basis):
         "version": PANEL_VERSION, "calendarSource": calendar_source, "priceBasis": price_basis,
         "calendarSha256": hashlib.sha256("\n".join(sessions.strftime("%Y-%m-%d")).encode()).hexdigest(),
         "start": str(sessions[0].date()), "asOf": str(sessions[-1].date()), "sessions": len(sessions),
-        "historySessions": HISTORY, "holdingSessions": HORIZON, "features": STOCK_FEATURES.copy(),
+        "historySessions": HISTORY, "holdingSessions": horizon, "features": STOCK_FEATURES.copy(),
         "securities": coverage, "rows": len(panel), "featureReadyRows": int(panel.featureReady.sum()),
         "limitations": ["Research-feature availability is not sufficient training history or investment eligibility.",
                         "Calendar, historical membership, adjustment/actions, lots and execution are not verified here.",
