@@ -192,7 +192,6 @@ def news_headlines(symbol, name, root):
     if len(response.content) > 2_000_000:
         raise ValueError("News feed is too large.")
     now = utc_now()
-    seen = load_json(root / "news-seen.json", {})
     articles = []
     for item in ET.fromstring(response.content).findall(".//item")[:12]:
         title = (item.findtext("title") or "").strip()[:700]
@@ -203,14 +202,15 @@ def news_headlines(symbol, name, root):
         if key in {a["id"] for a in articles}:
             continue
         try:
-            published = parsedate_to_datetime(item.findtext("pubDate") or "").astimezone(timezone.utc).isoformat()
+            published_time = parsedate_to_datetime(item.findtext("pubDate") or "")
+            if published_time.tzinfo is None:
+                continue
+            published = published_time.astimezone(timezone.utc).isoformat()
             if published > now:
                 continue
         except (ValueError, TypeError):
             continue
-        seen.setdefault(key, now)
-        articles.append({"id": key, "symbol": symbol, "title": title, "url": link, "source": item.findtext("source") or "Google News", "publishedAt": published, "firstSeenAt": seen[key]})
-    atomic_json(root / "news-seen.json", seen)
+        articles.append({"id": key, "symbol": symbol, "title": title, "url": link, "source": item.findtext("source") or "Google News", "publishedAt": published, "firstSeenAt": now})
     return articles[:6]
 
 
@@ -232,31 +232,21 @@ def sentiment_scores(articles):
 
 
 def resolve_ledger(root, frames):
-    ledger = load_json(root / "forecasts.json", [])
-    for forecast in ledger:
-        if forecast["status"] != "pending":
-            continue
-        symbols = forecast["universe"]
-        if any(s not in frames for s in symbols):
-            continue
-        dates = sorted(set.intersection(*(set(frames[s].index) for s in symbols)))
-        eligible = [d for d in dates if d.date().isoformat() > forecast["signalDate"]]
-        if len(eligible) < HORIZON + 1:
-            continue
-        entry, exit_date = eligible[0], eligible[HORIZON]
-        actual = {s: float(frames[s].loc[exit_date, "open"] / frames[s].loc[entry, "open"] - 1) for s in symbols}
-        cost = forecast["costBps"] / 10000
-        forecast.update(status="resolved", entryDate=str(entry.date()), exitDate=str(exit_date.date()), priceReturn=float(np.mean([actual[s] for s in forecast["pricePicks"]])) - cost, newsReturn=float(np.mean([actual[s] for s in forecast["newsPicks"]])) - cost, benchmarkReturn=float(np.mean(list(actual.values()))) - cost)
-        if "auditWeights" in forecast:
-            forecast["auditReturn"] = sum(w * actual[s] for s, w in forecast["auditWeights"].items()) - forecast["auditExposure"] * cost
-
-        if "policyWeights" in forecast:
-            forecast["policyReturn"] = sum(w * actual[s] for s, w in forecast["policyWeights"].items()) - forecast["policyExposure"] * cost
-
-    return ledger
+    # Legacy records lack contemporaneous source seals. Preserve them unchanged;
+    # only the separately versioned prospective ledger may resolve new outcomes.
+    return load_json(root / "forecasts.json", [])
 
 
-def run_research(config, root: Path, progress=lambda *_: None, loader=market_history, news_loader=news_headlines, scorer=sentiment_scores):
+def run_research(config, root: Path, progress=lambda *_: None, loader=market_history,
+                 news_loader=news_headlines, scorer=sentiment_scores, *, clock=utc_now, calendar=None):
+    from research.prospective import job_lock
+    with job_lock(root):
+        return _run_research(config, root, progress, loader, news_loader, scorer, clock, calendar)
+
+
+def _run_research(config, root, progress, loader, news_loader, scorer, clock, calendar):
+    from research import prospective
+    from research.price_analysis import get_analysis
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     frames, warnings = {}, []
     symbols = config["symbols"]
@@ -269,66 +259,21 @@ def run_research(config, root: Path, progress=lambda *_: None, loader=market_his
     if len(frames) < 4:
         raise ValueError("At least four stocks with usable daily history are needed. Public data may be temporarily unavailable; retry later.")
     top_k = min(config["topK"], len(frames))
-    panel, _ = feature_panel(frames)
-    from research.audit import AUDIT_VERSION
+    observation = prospective.observe_prices(root, frames, clock())
+    analysis, panel, analysis_key, model_hashes = get_analysis(config, root, frames, progress)
+    from research.audit import AUDIT_VERSION, RICH_FEATURES
     from research.policy import POLICY_VERSION
-    import sklearn
-    mature = panel.dropna(subset=["target", "labelEnd"])
     latest_date = panel.date.max()
-    code_hash = hashlib.sha256(Path(__file__).read_bytes() + Path(__file__).with_name("audit.py").read_bytes() + Path(__file__).with_name("policy.py").read_bytes()).hexdigest()
-    history_hash = hashlib.sha256(pd.util.hash_pandas_object(panel.sort_values(["date", "symbol"]), index=False).values.tobytes()).hexdigest()
-    analysis_key = hashlib.sha256(json.dumps({"history": history_hash, "code": code_hash, "years": config["years"], "topK": top_k, "costBps": config["costBps"], "version": VERSION, "audit": AUDIT_VERSION, "libraries": [np.__version__, pd.__version__, sklearn.__version__]}, sort_keys=True).encode()).hexdigest()
-    analysis_path = root / "analyses" / f"{analysis_key}.json"
-    cached = None
-    try:
-        candidate = load_json(analysis_path, None)
-        if candidate and candidate["key"] == analysis_key and candidate["checksum"] == hashlib.sha256(json.dumps(candidate["data"], sort_keys=True).encode()).hexdigest() and all((root / "models" / f"{candidate["data"][n]}.joblib").exists() for n in ["modelId", "auditId"]):
-            cached = candidate["data"]
-    except (ValueError, KeyError, TypeError):
-        pass  # A damaged local cache is rebuilt, never used as evidence.
-    if cached:
-        progress("Reusing unchanged price analysis; refreshing news and forward outcomes", 85)
-        backtest, audit = cached["backtest"], cached["audit"]
-        model_id, audit_id, fingerprint = cached["modelId"], cached["auditId"], cached["fingerprint"]
-        latest = pd.DataFrame(cached["latest"])
-    else:
-        backtest, mature = walk_forward(panel, top_k, config["costBps"], progress)
-        progress("Fitting final models on matured outcomes", 73)
-        latest_date = panel.date.max()
-        latest = panel[panel.date == latest_date].copy()
-        fingerprint = hashlib.sha256(pd.util.hash_pandas_object(mature[["date", "symbol", *FEATURES, "target"]], index=False).values.tobytes()).hexdigest()
-        model_id = hashlib.sha256(json.dumps({"version": VERSION, "symbols": sorted(frames), "data": fingerprint, "features": FEATURES, "code": code_hash}, sort_keys=True).encode()).hexdigest()[:12]
-        fitted = estimators()
-        for name, model in fitted.items():
-            model.fit(mature[FEATURES], mature.target)
-            latest[name] = model.predict(latest[FEATURES])
-        model_dir = root / "models"
-        model_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        with tempfile.NamedTemporaryFile(dir=model_dir, delete=False) as f:
-            model_temp = f.name
-        joblib.dump({"models": fitted, "features": FEATURES, "dataFingerprint": fingerprint, "version": VERSION}, model_temp)
-        os.chmod(model_temp, 0o600)
-        os.replace(model_temp, model_dir / f"{model_id}.joblib")
-        latest["Ensemble"] = ranked_blend(latest, list(estimators()))
-        from research.audit import run_audit, AUDIT_VERSION, RICH_FEATURES
-        audit, audit_models = run_audit(panel, top_k, config["costBps"], progress)
-        audit_fingerprint = hashlib.sha256(pd.util.hash_pandas_object(mature[["date", "symbol", *RICH_FEATURES, "target"]], index=False).values.tobytes()).hexdigest()
-        audit_id = hashlib.sha256(json.dumps({"version": AUDIT_VERSION, "data": audit_fingerprint, "topK": top_k, "costBps": config["costBps"], "code": code_hash}, sort_keys=True).encode()).hexdigest()[:12]
-        audit["modelId"] = audit_id
-        audit["dataFingerprint"] = audit_fingerprint
-        with tempfile.NamedTemporaryFile(dir=model_dir, delete=False) as f:
-            audit_temp = f.name
-        joblib.dump({**audit_models, "dataFingerprint": audit_fingerprint}, audit_temp)
-        os.chmod(audit_temp, 0o600)
-        os.replace(audit_temp, model_dir / f"{audit_id}.joblib")
-        analysis = {"backtest": backtest, "audit": audit, "modelId": model_id, "auditId": audit_id, "fingerprint": fingerprint, "latest": latest[["symbol", "close", "Ensemble", *estimators()]].to_dict("records")}
-        atomic_json(analysis_path, {"key": analysis_key, "checksum": hashlib.sha256(json.dumps(analysis, sort_keys=True).encode()).hexdigest(), "data": analysis})
+    mature = panel.dropna(subset=["target", "labelEnd"])
+    backtest, audit = analysis["backtest"], analysis["audit"]
+    model_id, audit_id, fingerprint = analysis["modelId"], analysis["auditId"], analysis["fingerprint"]
+    latest = pd.DataFrame(analysis["latest"])
     articles = []
     if config["includeNews"]:
         for i, symbol in enumerate(frames):
             progress(f"Reading headlines for {symbol}", 86 + int(i / len(frames) * 7))
             try:
-                articles.extend(news_loader(symbol, config.get("names", {}).get(symbol), root))
+                articles.extend(prospective.capture_news(root, news_loader(symbol, config.get("names", {}).get(symbol), root), clock()))
             except Exception:
                 warnings.append(f"{symbol}: news unavailable; no news adjustment applied.")
         progress("Scoring headlines locally with FinBERT", 94)
@@ -337,7 +282,8 @@ def run_research(config, root: Path, progress=lambda *_: None, loader=market_his
         except Exception as e:
             warnings.append(f"FinBERT unavailable ({type(e).__name__}); news overlay disabled, price models still available.")
             articles = []
-    now = utc_now()
+    now = clock()
+    prospective.validate_news(root, articles, prospective.instant(now))
     rankings = []
     for _, row in latest.iterrows():
         headlines = [a for a in articles if a["symbol"] == row.symbol]
@@ -350,17 +296,22 @@ def run_research(config, root: Path, progress=lambda *_: None, loader=market_his
     rankings.sort(key=lambda r: r["score"], reverse=True)
     price_picks = [r["symbol"] for r in sorted(rankings, key=lambda r: r["priceScore"], reverse=True)[:top_k]]
     news_picks = [r["symbol"] for r in rankings[:top_k]]
-    ledger = resolve_ledger(root, frames)
-    signal_date = max(str(latest_date.date()), datetime.now(ZoneInfo("Asia/Kolkata")).date().isoformat())
-    experiment = hashlib.sha256(json.dumps({"symbols": sorted(frames), "topK": top_k, "costBps": config["costBps"], "includeNews": config["includeNews"], "version": VERSION, "overlay": "freshness-v1", "audit": AUDIT_VERSION, "policy": POLICY_VERSION, "years": config["years"]}, sort_keys=True).encode()).hexdigest()[:12]
+    issued_at = clock()
+    signal_date = max(str(latest_date.date()), prospective.instant(issued_at).astimezone(ZoneInfo("Asia/Kolkata")).date().isoformat())
+    experiment = hashlib.sha256(json.dumps({"symbols": sorted(frames), "topK": top_k, "costBps": config["costBps"], "includeNews": config["includeNews"], "version": VERSION, "overlay": "freshness-v1", "ledger": prospective.VERSION, "audit": AUDIT_VERSION, "policy": POLICY_VERSION, "years": config["years"]}, sort_keys=True).encode()).hexdigest()[:12]
     forecast_id = f"{experiment}-{signal_date}"
-    if not any(p["id"] == forecast_id for p in ledger):
-        ledger.append({"id": forecast_id, "createdAt": now, "signalDate": signal_date, "modelId": model_id, "experiment": experiment, "universe": sorted(frames), "pricePicks": price_picks, "newsPicks": news_picks, "costBps": config["costBps"], "status": "pending", "newsEnabled": bool(articles), "auditModelId": audit_id, "auditStrategy": audit["latest"]["strategy"], "auditWeights": {a["symbol"]: a["weight"] for a in audit["latest"]["allocations"]}, "auditExposure": audit["latest"]["exposure"], "policyVersion": POLICY_VERSION, "policyWeights": {a["symbol"]: a["weight"] for a in audit["policy"]["latest"]["allocations"]}, "policyExposure": audit["policy"]["latest"]["exposure"]})
-    ledger = ledger[-500:]
-    atomic_json(root / "forecasts.json", ledger)
-    if articles:
-        atomic_json(root / "news" / f"{forecast_id}-{now[:19].replace(':', '-')}.json", {"recordedAt": now, "model": "ProsusAI/finbert", "revision": TEXT_REVISION, "articles": articles})
-    stale_days = (datetime.now(ZoneInfo("Asia/Kolkata")).date() - latest_date.date()).days
+    forecast = {"id": forecast_id, "createdAt": issued_at, "signalDate": signal_date, "modelId": model_id, "experiment": experiment, "universe": sorted(frames), "pricePicks": price_picks, "newsPicks": news_picks, "costBps": config["costBps"], "status": "pending", "newsEnabled": bool(articles), "auditModelId": audit_id, "auditStrategy": audit["latest"]["strategy"], "auditWeights": {a["symbol"]: a["weight"] for a in audit["latest"]["allocations"]}, "auditExposure": audit["latest"]["exposure"], "policyVersion": POLICY_VERSION, "policyWeights": {a["symbol"]: a["weight"] for a in audit["policy"]["latest"]["allocations"]}, "policyExposure": audit["policy"]["latest"]["exposure"]}
+    features = panel[panel.date == latest_date][["date", "symbol", *RICH_FEATURES]].assign(
+        date=lambda x: x.date.dt.strftime("%Y-%m-%d")).to_dict("records")
+    prospective.issue(root, forecast, rankings=rankings, features=features, articles=articles,
+        observation=observation, model_hashes=model_hashes, analysis_key=analysis_key,
+        text_revision=TEXT_REVISION, data_fingerprint=fingerprint, feature_cutoff=now)
+    if calendar is None:
+        calendar = load_json(root / prospective.VERSION / "calendar.json", None)
+    ledger, pending_reasons = prospective.ledger_view(root, observation, calendar, HORIZON)
+    warnings.extend(pending_reasons)
+    warnings.append("New forecasts have local immutable evidence. Legacy forecasts remain unverified in their original files. Outcome resolution requires a reviewed session calendar; adjusted prices and fees remain provisional.")
+    stale_days = (prospective.instant(now).astimezone(ZoneInfo("Asia/Kolkata")).date() - latest_date.date()).days
     if stale_days > 4:
         warnings.append(f"Latest common market data is {stale_days} calendar days old. Treat rankings as stale.")
     warnings.extend(["Historical evaluation uses today's selected stock cohort; survivorship bias remains.", "News overlay is experimental and excluded from the historical price backtest. Sentiment is not a return probability.", "Adjusted public prices can be revised. Backtest is a research simulation, not an execution record.", "Five-session sampled drawdown misses losses inside each holding period. Cost is a configurable assumption, not a verified broker charge.", "Paper forecasts may overlap across days; their individual returns must not be compounded as an executable portfolio."])

@@ -105,8 +105,7 @@ class ResearchWorkflow(unittest.TestCase):
         self.assertIn("missing_or_ambiguous_issuance_report", check(r=later)["featureIssues"])
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
-            # Existing resolver accepts supplied future bars. Demonstrate that
-            # such a result cannot pass the independent evidence admission gate.
+            # Legacy evidence is now preserved, even if future bars are supplied.
             from research.engine import resolve_ledger
             ledger_path = root / "forecasts.json"
             ledger_path.write_text(json.dumps([forecast]))
@@ -115,8 +114,7 @@ class ResearchWorkflow(unittest.TestCase):
             frames = {s: pd.DataFrame({"open": np.arange(len(dates)) + 100.}, index=dates)
                       for s in ["A", "B"]}
             premature = resolve_ledger(root, frames)[0]
-            self.assertEqual(premature["status"], "resolved")
-            self.assertIn("invalid_or_future_exit", check(f=premature)["outcomeIssues"])
+            self.assertEqual(premature["status"], "pending")
             self.assertEqual(sha(ledger_path), ledger_hash)
             inputs = []
             for role, payload in [("ledger", [forecast]), ("news", snapshot),
@@ -731,8 +729,16 @@ class ResearchWorkflow(unittest.TestCase):
     def test_train_export_repeat_and_resolve_future_outcomes(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
+            from research import prospective, price_analysis
             run = lambda loader: run_research(CONFIG, root, loader=loader, news_loader=fixture_news, scorer=fixture_scores)
             first = run(fixture_loader())
+            issue_path = next((root / prospective.VERSION / "issues").glob("*.json"))
+            issue_bytes = issue_path.read_bytes()
+            issue = prospective.read_seal(issue_path)
+            self.assertEqual(len(issue["features"]), 4)
+            self.assertTrue(all("date" in r and "actual" not in r for r in issue["features"]))
+            self.assertTrue(all(a["contentSha256"] for a in issue["articles"]))
+            self.assertFalse((root / "forecasts.json").exists())
             self.assertEqual(len(first["rankings"]), 4)
             self.assertEqual(len(first["backtest"]["metrics"]), 6)
             self.assertEqual(len(first["articles"]), 4)
@@ -815,23 +821,53 @@ class ResearchWorkflow(unittest.TestCase):
             self.assertEqual(first["forecasts"][0]["status"], "pending")
             # Repeating unchanged data skips fitting, but still refreshes news and
             # resolves the ledger. A revised future price must invalidate reuse.
-            with patch("research.engine.walk_forward", side_effect=AssertionError("Unexpected retraining")):
+            with patch("research.price_analysis.fit_analysis", side_effect=AssertionError("Unexpected retraining")):
                 second = run(fixture_loader())
             self.assertEqual(second["backtest"], first["backtest"])
             self.assertEqual(second["audit"], first["audit"])
-            cache = next(p for p in (root / "analyses").glob("*.json") if json.loads(p.read_text())["data"]["fingerprint"] == first["dataFingerprint"])
+            self.assertEqual(issue_path.read_bytes(), issue_bytes)
+            # Bookkeeping changes do not affect training identity; price logic does.
+            training_hash = price_analysis.training_code_hash()
+            with patch.object(prospective, "VERSION", "offline-bookkeeping-fixture"):
+                self.assertEqual(price_analysis.training_code_hash(), training_hash)
+            with patch("research.engine.HORIZON", HORIZON + 1):
+                self.assertNotEqual(price_analysis.training_code_hash(), training_hash)
+            cache = next(p for p in (root / "analyses-v2").glob("*.json") if json.loads(p.read_text())["data"]["fingerprint"] == first["dataFingerprint"])
+            cache_bytes = cache.read_bytes()
             damaged = json.loads(cache.read_text())
             damaged["data"]["backtest"]["metrics"][0]["totalReturn"] = 123
             cache.write_text(json.dumps(damaged))
-            recovered = run(fixture_loader())
-            self.assertEqual(recovered["backtest"], first["backtest"])
+            with self.assertRaisesRegex(ValueError, "cache integrity"):
+                run(fixture_loader())
+            cache.write_bytes(cache_bytes)
             self.assertEqual(len(second["forecasts"]), 1)
             self.assertEqual(second["forecasts"][0]["createdAt"], first["forecasts"][0]["createdAt"])
             longer = run_research({**CONFIG, "years": 5}, root, loader=fixture_loader(), news_loader=fixture_news, scorer=fixture_scores)
             self.assertNotEqual(longer["id"], first["id"])
             self.assertEqual(len(longer["forecasts"]), 1)
-            resolved = run(fixture_loader(extended=True))
-            old = next(f for f in resolved["forecasts"] if f["id"] == first["id"])
+            # A future observation cannot enter training or resolution under today's clock.
+            with patch("research.price_analysis.fit_analysis", side_effect=AssertionError("Unexpected fitting")):
+                with self.assertRaisesRegex(ValueError, "future daily price"):
+                    run(fixture_loader(extended=True))
+            source = fixture_loader(extended=True)
+            frames = {s: source(s, 3, root) for s in SYMBOLS}
+            last = max(frames[SYMBOLS[0]].index).date()
+            future_clock = datetime.combine(last + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc).isoformat()
+            observation = prospective.observe_prices(root, frames, future_clock)
+            pending, reason = prospective.resolve(root, issue, observation, None, HORIZON)
+            self.assertIsNone(pending)
+            self.assertIn("calendar", reason)
+            sessions = [d.date().isoformat() for d in frames[SYMBOLS[0]].index]
+            calendar = {"sessions": sessions, "coverageStart": sessions[0], "coverageEnd": sessions[-1],
+                        "source": "Explicit offline fixture calendar", "sourceSha256": hashlib.sha256(b"fixture").hexdigest()}
+            gap_frames = {s: f.copy() for s, f in frames.items()}
+            future_days = [d for d in frames[SYMBOLS[0]].index if d.date().isoformat() > first["forecasts"][0]["signalDate"]]
+            gap_frames[SYMBOLS[0]] = gap_frames[SYMBOLS[0]].drop(future_days[1])
+            gap_observation = prospective.observe_prices(root, gap_frames, future_clock)
+            self.assertIsNone(prospective.resolve(root, issue, gap_observation, calendar, HORIZON)[0])
+            outcome, reason = prospective.resolve(root, issue, observation, calendar, HORIZON)
+            self.assertIsNone(reason)
+            old = {**issue["forecast"], **outcome["result"]}
             self.assertEqual(old["status"], "resolved")
             self.assertGreater(old["entryDate"], old["signalDate"])
             dates = pd.bdate_range(old["entryDate"], old["exitDate"])
@@ -843,7 +879,25 @@ class ResearchWorkflow(unittest.TestCase):
             self.assertAlmostEqual(old["auditReturn"], audit_actual)
             policy_actual = sum(w * (source(s, 3, root).loc[old["exitDate"], "open"] / source(s, 3, root).loc[old["entryDate"], "open"] - 1) for s, w in old["policyWeights"].items()) - old["policyExposure"] * .002
             self.assertAlmostEqual(old["policyReturn"], policy_actual)
-            self.assertTrue(any("overlap" in w for w in resolved["warnings"]))
+            self.assertTrue(any("overlap" in w for w in second["warnings"]))
+            self.assertEqual(issue_path.read_bytes(), issue_bytes)
+            revised = {s: f * 2 for s, f in frames.items()}
+            later_observation = prospective.observe_prices(root, revised, future_clock)
+            self.assertEqual(prospective.resolve(root, issue, later_observation, calendar, HORIZON)[0], outcome)
+            self.assertIsNone(prospective.resolve(root, issue, issue["observationSha256"], calendar, HORIZON)[0])
+            late_article = {**issue["articles"][0], "firstSeenAt": future_clock}
+            with self.assertRaisesRegex(ValueError, "Unavailable news"):
+                prospective.capture_news(root, [late_article], issue["featureCutoffAt"])
+            receipt = dict(issue["articles"][0])
+            revised_content = {**receipt, "title": "A later revised offline headline"}
+            captured = prospective.capture_news(root, [revised_content], future_clock)[0]
+            self.assertNotEqual(captured["contentSha256"], receipt["contentSha256"])
+            self.assertEqual(captured["firstSeenAt"], future_clock)
+            for path in (root / prospective.VERSION).rglob("*.json"):
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            issue_path.write_text("{}")
+            with self.assertRaises((ValueError, KeyError)):
+                prospective.ledger_view(root, observation, calendar, HORIZON)
 
     def test_local_access_invalid_input_and_full_job(self):
         with tempfile.TemporaryDirectory() as folder:
