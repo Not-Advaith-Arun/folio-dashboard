@@ -49,6 +49,104 @@ def fixture_scores(articles):
 
 
 class ResearchWorkflow(unittest.TestCase):
+    def test_news_snapshot_feature_forecast_admission_audit(self):
+        # A complete frozen export -> feature -> forecast -> audit workflow.
+        # Adversarial timing/provenance cases are critical financial boundaries;
+        # no estimator or network is needed to verify them.
+        from copy import deepcopy
+        from research.news_audit import audit_bundle, run_audit, sha, VERSION
+        issued = "2026-10-11T20:00:00+00:00"  # Already October 12 in India.
+        articles = [{"id": s, "symbol": s, "title": "Offline fixture", "source": "Fixture",
+                     "url": "https://example.com/fixture", "publishedAt": issued,
+                     "firstSeenAt": issued, "sentiment": score, "label": label}
+                    for s, score, label in [("A", .6, "positive"), ("B", -.4, "negative")]]
+        forecast = {"id": "fixture-2026-10-12", "createdAt": issued, "signalDate": "2026-10-12",
+            "status": "pending", "modelId": "fixture-model", "universe": ["A", "B"],
+            "newsEnabled": True, "pricePicks": ["A"], "newsPicks": ["A"], "costBps": 20}
+        report = {"id": forecast["id"], "generatedAt": issued, "modelId": forecast["modelId"],
+            "dataFingerprint": "fixture-only", "textModelRevision": "fixture-text-model",
+            "config": {"topK": 1}, "articles": articles, "rankings": [
+                {"symbol": "A", "priceScore": .75, "newsScore": .6, "score": .84, "headlines": 1},
+                {"symbol": "B", "priceScore": .25, "newsScore": -.4, "score": .19, "headlines": 1}]}
+        snapshot = {"recordedAt": issued, "revision": "fixture-text-model", "articles": articles}
+        seen = {a["id"]: issued for a in articles}
+        as_of = "2026-10-19T01:00:00Z"
+        def check(f=forecast, s=snapshot, r=report):
+            return audit_bundle([f], {"news": s}, {"run": r}, seen, as_of)["forecasts"][0]
+        clean = check()
+        self.assertTrue(clean["reconstructionPassed"])
+        self.assertFalse(clean["prospectiveEligible"])
+        self.assertEqual(len(clean["predictions"]), 2)
+        # Publication backfills do not excuse first-seen availability after issuance.
+        for key, value in [("firstSeenAt", "2026-10-12T01:00:00Z"),
+                           ("publishedAt", "2026-10-12T01:00:00Z"),
+                           ("firstSeenAt", "2026-10-11T20:00:00")]:
+            changed = deepcopy(report)
+            changed["articles"][0][key] = value
+            self.assertFalse(check(r=changed)["reconstructionPassed"])
+        changed = deepcopy(snapshot)
+        changed["articles"][0]["title"] = "Revised same-ID content"
+        self.assertIn("missing_or_ambiguous_exact_news_snapshot", check(s=changed)["featureIssues"])
+        changed = deepcopy(report)
+        changed["rankings"][0]["score"] = 99
+        self.assertIn("overlay_feature_mismatch", check(r=changed)["featureIssues"])
+        self.assertIn("newsPicks_mismatch", check(f={**forecast, "newsPicks": ["B"]})["featureIssues"])
+        self.assertIn("signal_before_actual_issuance_day", check(f={**forecast, "signalDate": "2026-10-11"})["featureIssues"])
+        invalid_outcome = check(f={**forecast, "status": "resolved", "entryDate": "2026-10-12", "exitDate": "2026-10-20"})
+        self.assertIn("entry_not_after_actual_issuance_day", invalid_outcome["outcomeIssues"])
+        self.assertIn("invalid_or_future_exit", invalid_outcome["outcomeIssues"])
+        self.assertFalse(invalid_outcome["prospectiveEligible"])
+        later = deepcopy(report)
+        later["generatedAt"] = "2026-10-12T02:00:00Z"
+        later["rankings"][0]["score"] = 999
+        joined = audit_bundle([forecast], {"news": snapshot}, {"original": report, "later": later}, seen, as_of)
+        self.assertEqual(joined["forecasts"][0]["predictions"], clean["predictions"])
+        self.assertEqual(joined["summary"]["laterRefreshes"], 1)
+        self.assertIn("missing_or_ambiguous_issuance_report", check(r=later)["featureIssues"])
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            # Existing resolver accepts supplied future bars. Demonstrate that
+            # such a result cannot pass the independent evidence admission gate.
+            from research.engine import resolve_ledger
+            ledger_path = root / "forecasts.json"
+            ledger_path.write_text(json.dumps([forecast]))
+            ledger_hash = sha(ledger_path)
+            dates = pd.bdate_range("2026-10-13", periods=HORIZON + 1)
+            frames = {s: pd.DataFrame({"open": np.arange(len(dates)) + 100.}, index=dates)
+                      for s in ["A", "B"]}
+            premature = resolve_ledger(root, frames)[0]
+            self.assertEqual(premature["status"], "resolved")
+            self.assertIn("invalid_or_future_exit", check(f=premature)["outcomeIssues"])
+            self.assertEqual(sha(ledger_path), ledger_hash)
+            inputs = []
+            for role, payload in [("ledger", [forecast]), ("news", snapshot),
+                                  ("report", report), ("first_seen", seen)]:
+                path = root / (role + ".json")
+                path.write_text(json.dumps(payload))
+                inputs.append({"role": role, "path": str(path), "sha256": sha(path)})
+            protocol = root / "protocol.json"
+            protocol.write_text(json.dumps({"version": VERSION, "frozenAt": as_of,
+                "auditAsOf": as_of, "engineSha256": sha(Path(__file__).with_name("engine.py")),
+                "parentCommit": "offline-fixture", "inputs": inputs, "outputDir": str(root / "run")}))
+            result = run_audit(protocol)
+            self.assertEqual(result["summary"]["reconstructable"], 1)
+            self.assertEqual(result["summary"]["verifiedProspective"], 0)
+            with patch("research.news_audit.audit_bundle", side_effect=AssertionError("Unexpected repeat audit")):
+                self.assertEqual(run_audit(protocol), result)
+            self.assertTrue(all(sha(i["path"]) == i["sha256"] for i in inputs))
+            for path in (root / "run").iterdir():
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            # Input and result edits fail closed, rather than recomputing clean evidence.
+            source = Path(inputs[1]["path"])
+            original = source.read_bytes()
+            source.write_text("{}")
+            with self.assertRaisesRegex(ValueError, "Input hash"):
+                run_audit(protocol)
+            source.write_bytes(original)
+            (root / "run/audit.json").write_text("{}")
+            with self.assertRaisesRegex(ValueError, "lineage/hash"):
+                run_audit(protocol)
+
     def test_architecture_training_allocation_replay_and_immutable_export(self):
         # One spanning model workflow covers financial timing, future-data
         # selection, private artifacts and unchanged-run reuse, not tree internals.
