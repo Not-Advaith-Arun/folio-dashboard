@@ -152,6 +152,9 @@ class ResearchWorkflow(unittest.TestCase):
                                            allocate, run_experiment, sha)
         from research.normalized import (TARGET, BOOKS as NORMALIZED_BOOKS, normalize_panel,
                                          fit_scaled, run_experiment as run_normalized)
+        from research.payoff import (SPEC as PAYOFF_SPEC, BOOKS as PAYOFF_BOOKS, OUTPUTS,
+                                     fit_payoff, reference_cost, code_hashes,
+                                     run_experiment as run_payoff)
         dates = pd.bdate_range("2020-01-01", periods=960)
         frames = {}
         for i in range(5):
@@ -194,6 +197,24 @@ class ResearchWorkflow(unittest.TestCase):
         pd.testing.assert_frame_equal(scaled_before[columns + ["targetScale"]], scaled_after[columns + ["targetScale"]])
         self.assertEqual(scaled_lineage, later_scaled_lineage)
         np.testing.assert_allclose(scaled_before.actual, panel.loc[scaled_before.index, "actual"], equal_nan=True)
+        payoff_before, payoff_lineage, _ = fit_payoff(panel, signal)
+        payoff_after, later_payoff_lineage, _ = fit_payoff(future, signal)
+        # Critical economic/timing boundary: conditional gain/loss estimates
+        # and the calibrated event probability must not see the future path.
+        payoff_columns = [k for k in OUTPUTS if k != "q10"]
+        pd.testing.assert_frame_equal(payoff_before[payoff_columns], payoff_after[payoff_columns])
+        self.assertEqual(payoff_lineage, later_payoff_lineage)
+        np.testing.assert_allclose(payoff_before.uncalibratedNetProxy,
+            payoff_before.proxyProbability * payoff_before.gain -
+            (1 - payoff_before.proxyProbability) * payoff_before.loss)
+        np.testing.assert_allclose(payoff_before["mean"] - reference_cost(), payoff_before.netProxy)
+        self.assertTrue(payoff_before.proxyProbability.between(0, 1).all())
+        self.assertTrue((payoff_before[["gain", "loss"]] >= 0).all().all())
+        for key in ["trainLastOutcome", "calibrationStart", "calibrationLastOutcome"]:
+            self.assertEqual(payoff_lineage[key], lineage[key])
+        payoff_before["q10"], payoff_after["q10"] = before.q10, after.q10
+        for allocator in PAYOFF_BOOKS.values():
+            self.assertEqual(allocate(payoff_before, allocator), allocate(payoff_after, allocator))
         for book in ["dual_head", "ensemble_mean_only", "ridge_mean_only", "trend"]:
             weights = allocate(before, book)
             self.assertEqual(weights, allocate(after, book))
@@ -256,6 +277,52 @@ class ResearchWorkflow(unittest.TestCase):
                 self.assertEqual(artifact.stat().st_mode & 0o777, 0o600)
             with patch("research.normalized.fit_scaled", side_effect=AssertionError("Repeated normalized fit")):
                 self.assertTrue(run_normalized(normalized_protocol)["cacheHit"])
+            payoff_root = root / "payoff"
+            payoff_root.mkdir()
+            plan = payoff_root / "PLAN.json"
+            plan.write_text(json.dumps({"fixture": True, "spec": PAYOFF_SPEC}))
+            payoff_protocol = payoff_root / "protocol.json"
+            completion = normalized_root / "run/completed.json"
+            payoff_protocol.write_text(json.dumps({
+                "frozenAt": datetime.now(timezone.utc).isoformat(), "spec": PAYOFF_SPEC,
+                "books": list(PAYOFF_BOOKS), "code": code_hashes(),
+                "plan": {"path": str(plan), "sha256": sha(plan)},
+                "references": {
+                    "original": {"protocol": {"path": str(p), "sha256": sha(p)},
+                                 "completed": {"path": str(original_completion), "sha256": original_hash}},
+                    "normalized": {"protocol": {"path": str(normalized_protocol), "sha256": sha(normalized_protocol)},
+                                   "completed": {"path": str(completion), "sha256": sha(completion)}}}}))
+            with patch("pickle.load", side_effect=AssertionError("Baseline pickle loaded")), \
+                 patch("research.architecture.fit_at", side_effect=AssertionError("Baseline refitted")):
+                payoff_result = run_payoff(payoff_protocol)
+            self.assertFalse(payoff_result["cacheHit"])
+            self.assertFalse(payoff_result["livePromotionAllowed"])
+            self.assertEqual(payoff_result["fitCount"], result["fitCount"])
+            self.assertTrue(payoff_result["predictiveAcceptanceChecks"]["unchanged_downside"])
+            self.assertTrue(payoff_result["predictiveAcceptanceChecks"]["same_scored_coverage"])
+            for slip, books in normalized_result["comparison"].items():
+                for book, expected in books.items():
+                    self.assertEqual(payoff_result["comparison"][slip][book], expected)
+            payoff_rows = json.loads((payoff_root / "run/forecasts.json").read_text())
+            self.assertTrue(any(r["mean"] is not None and r["actual"] is None for r in payoff_rows))
+            for artifact in (payoff_root / "run").iterdir():
+                self.assertEqual(artifact.stat().st_mode & 0o777, 0o600)
+            with patch("research.payoff.fit_payoff", side_effect=AssertionError("Repeated payoff fit")):
+                self.assertTrue(run_payoff(payoff_protocol)["cacheHit"])
+            artifact = payoff_root / "run/decisions.json"
+            saved = artifact.read_bytes()
+            artifact.write_text("{}")
+            with self.assertRaisesRegex(ValueError, "Completed artifact hash"):
+                run_payoff(payoff_protocol)
+            artifact.write_bytes(saved)
+            # Reject incomplete conditional targets rather than silently
+            # replacing a blocked model with a profitable-looking fallback.
+            one_class = panel.copy()
+            one_class["actual"] = .05
+            blocked, reason, models = fit_payoff(one_class, signal)
+            self.assertIsNone(blocked)
+            self.assertIsNone(models)
+            self.assertEqual(reason["status"], "insufficient_payoff_classes")
             forecasts_path = root / "run/forecasts.json"
             original = forecasts_path.read_bytes()
             forecasts_path.write_text("[]")
@@ -263,11 +330,15 @@ class ResearchWorkflow(unittest.TestCase):
                 run_experiment(p)
             with self.assertRaisesRegex(ValueError, "Reference artifact hash"):
                 run_normalized(normalized_protocol)
+            with self.assertRaisesRegex(ValueError, "Reference artifact hash"):
+                run_payoff(payoff_protocol)
             forecasts_path.write_bytes(original)
             source_path = Path(protocol["featureInputs"][0]["path"])
             source_path.write_text("[]")
             with self.assertRaisesRegex(ValueError, "Source hash"):
                 run_experiment(p)
+            with self.assertRaisesRegex(ValueError, "Source hash"):
+                run_payoff(payoff_protocol)
 
     def test_session_data_readiness_leakage_and_export(self):
         # Missing-data selection and label timing are critical financial
